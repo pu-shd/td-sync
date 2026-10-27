@@ -324,6 +324,26 @@ hc_ping /start </dev/null
   printf 'Dry run: %s\n\n' "$TD_DRY_RUN"
 } >"$log_file"
 
+# Schedule the next run before any slow work (environment scan, rsync), so a time
+# limit, node failure, or preemption that kills this job cannot break the chain.
+# afterany keeps it from starting while this run is still going.
+next_job_id=""
+requeue_note="Requeue interval not set"
+if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
+  dependency_args=()
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    dependency_args=("--dependency=afterany:${SLURM_JOB_ID}")
+  fi
+  if next_job_id="$(sbatch --parsable "${SBATCH_ARGS[@]}" ${dependency_args[@]+"${dependency_args[@]}"} --begin="now+${TD_SUBMIT_INTERVAL}" "$SELF_PATH")"; then
+    next_job_id="${next_job_id%%;*}"
+    requeue_note="Next run scheduled after $TD_SUBMIT_INTERVAL (job $next_job_id)"
+  else
+    next_job_id=""
+    printf 'Unable to requeue job with interval %s\n' "$TD_SUBMIT_INTERVAL" >>"$log_file"
+    requeue_note="Failed to schedule next run; check logs"
+  fi
+fi
+
 rsync_opts=("-av")
 if [[ "$TD_DRY_RUN" == "1" ]]; then
   rsync_opts+=("--dry-run")
@@ -419,26 +439,6 @@ if [[ -n "$TD_RSYNC_OPTS" ]]; then
   unset extra_opts
 fi
 rsync_opts+=("$TD_SRC" "$TD_DEST")
-
-# Schedule the next run before rsync starts, so a time limit, node failure, or
-# preemption that kills this job cannot break the chain. afterany keeps it from
-# starting while this run is still going.
-next_job_id=""
-requeue_note="Requeue interval not set"
-if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
-  dependency_args=()
-  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-    dependency_args=("--dependency=afterany:${SLURM_JOB_ID}")
-  fi
-  if next_job_id="$(sbatch --parsable "${SBATCH_ARGS[@]}" ${dependency_args[@]+"${dependency_args[@]}"} --begin="now+${TD_SUBMIT_INTERVAL}" "$SELF_PATH")"; then
-    next_job_id="${next_job_id%%;*}"
-    requeue_note="Next run scheduled after $TD_SUBMIT_INTERVAL (job $next_job_id)"
-  else
-    next_job_id=""
-    printf 'Unable to requeue job with interval %s\n' "$TD_SUBMIT_INTERVAL" >>"$log_file"
-    requeue_note="Failed to schedule next run; check logs"
-  fi
-fi
 
 set +e
 rsync "${rsync_opts[@]}" &>>"$log_file"

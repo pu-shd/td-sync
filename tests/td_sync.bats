@@ -496,3 +496,20 @@ RECORD
   [[ ! -e "$dest/exp/9/we,ird" ]]
   [[ ! -e "$dest/env1" ]]
 }
+
+@test "next run is scheduled before the environment scan" {
+  root="$(make_env_tree)"
+  submit_profile_fixture scanorder "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  tools="$BATS_TEST_TMPDIR/tools-scanorder"
+  mkdir -p "$tools"
+  real_find="$(command -v find)"
+  printf '#!/usr/bin/env bash\nprintf "find\\n" >>"$TD_MOCK_OUTPUT"\nexec %q "$@"\n' "$real_find" >"$tools/find"
+  chmod +x "$tools/find"
+  run env PATH="$tools:$PROJECT_ROOT/mocks/bin:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/scanorder.job.sh"
+  [ "$status" -eq 0 ]
+  sbatch_line="$(grep -n '^sbatch ' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  find_line="$(grep -n '^find$' "$TD_MOCK_OUTPUT" | head -1 | cut -d: -f1)"
+  [ -n "$sbatch_line" ]
+  [ -n "$find_line" ]
+  [ "$sbatch_line" -lt "$find_line" ]
+}
