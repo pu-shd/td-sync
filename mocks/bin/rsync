@@ -5,6 +5,12 @@ if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
   printf 'rsync %s\n' "$*" >>"$TD_MOCK_OUTPUT"
 fi
 
+for arg in "$@"; do
+  if [[ "$arg" == --exclude-from=* && -n "${TD_MOCK_OUTPUT:-}" ]]; then
+    cat "${arg#--exclude-from=}" >>"${TD_MOCK_OUTPUT}.exclude-from"
+  fi
+done
+
 echo "mock rsync transfer"
 
 # Simulate Slurm killing the batch script at its time limit.

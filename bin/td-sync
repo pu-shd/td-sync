@@ -29,6 +29,7 @@ Optional profile settings:
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
   TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
   TD_NOTIFY_MIN_INTERVAL  Minimum seconds between report emails per profile (default: 3600; 0 disables).
+  TD_EXCLUDE_ENVS         When 1/true, skip any source directory containing conda-meta/ or pyvenv.cfg.
   TD_HC_URL               healthchecks.io ping URL; pinged at start and with the exit status at the end.
   TD_RELAY_HOST           Host to send pings and report email through via ssh, for compute nodes
                           without internet or working mail (e.g. della9).
@@ -142,7 +143,7 @@ purge_old_logs() {
 load_profile() {
   local profile_path="$1"
 
-  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL
+  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL TD_EXCLUDE_ENVS
   TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
@@ -230,6 +231,11 @@ write_job_script() {
     dry_flag="1"
   fi
 
+  local exclude_envs_flag="0"
+  if is_truthy "${TD_EXCLUDE_ENVS:-}"; then
+    exclude_envs_flag="1"
+  fi
+
   local mailer_escaped
   local td_src_escaped
   local td_dest_escaped
@@ -263,6 +269,7 @@ write_job_script() {
     printf 'TD_DEST=%s\n' "$td_dest_escaped"
     printf 'TD_NOTIFY=%s\n' "$td_notify_escaped"
     printf 'TD_DRY_RUN=%s\n' "$dry_flag"
+    printf 'TD_EXCLUDE_ENVS=%s\n' "$exclude_envs_flag"
     printf 'TD_SUBMIT_INTERVAL=%s\n' "$td_interval_escaped"
     printf 'TD_LOG_DIR=%s\n' "$log_dir_escaped"
   printf 'LOG_BASENAME=%s\n' "$log_base_escaped"
@@ -283,7 +290,8 @@ mkdir -p "${TD_LOG_DIR}"
 timestamp="$(date +"%Y%m%dT%H%M%S")"
 log_file="${TD_LOG_DIR}/${LOG_BASENAME}_${timestamp}.log"
 summary_file="$(mktemp)"
-trap 'rm -f "$summary_file"' EXIT
+exclude_file="$(mktemp)"
+trap 'rm -f "$summary_file" "$exclude_file"' EXIT
 
 # Compute nodes may have no internet or working mail; when TD_RELAY_HOST is set,
 # run outbound commands there over ssh, the same way rsync reaches a remote host.
@@ -307,18 +315,6 @@ hc_ping() {
 
 hc_ping /start </dev/null
 
-rsync_opts=("-av")
-if [[ "$TD_DRY_RUN" == "1" ]]; then
-  rsync_opts+=("--dry-run")
-fi
-if [[ -n "$TD_RSYNC_OPTS" ]]; then
-  extra_opts=()
-  eval "extra_opts=($TD_RSYNC_OPTS)"
-  rsync_opts+=("${extra_opts[@]}")
-  unset extra_opts
-fi
-rsync_opts+=("$TD_SRC" "$TD_DEST")
-
 {
   printf 'Tiny Data Sync job: %s\n' "$JOB_NAME"
   printf 'Started: %s\n' "$timestamp"
@@ -326,6 +322,52 @@ rsync_opts+=("$TD_SRC" "$TD_DEST")
   printf 'Destination: %s\n' "$TD_DEST"
   printf 'Dry run: %s\n\n' "$TD_DRY_RUN"
 } >"$log_file"
+
+rsync_opts=("-av")
+if [[ "$TD_DRY_RUN" == "1" ]]; then
+  rsync_opts+=("--dry-run")
+fi
+
+# Environments can have any name, so find them by their marker files and exclude
+# each root with a pattern anchored at the transfer root. These rules precede
+# TD_RSYNC_OPTS because rsync applies the first matching filter.
+if [[ "$TD_EXCLUDE_ENVS" == "1" ]]; then
+  if [[ "$TD_SRC" =~ ^[^/]*: ]]; then
+    printf 'Warning: TD_EXCLUDE_ENVS ignored; cannot scan remote source %s\n\n' "$TD_SRC" >>"$log_file"
+  else
+    src_root="${TD_SRC%/}"
+    anchor_prefix=""
+    if [[ "$TD_SRC" != */ ]]; then
+      anchor_prefix="/$(basename "$src_root")"
+    fi
+    env_count=0
+    while IFS= read -r -d '' env_dir; do
+      rel="${env_dir#"$src_root"}"
+      if [[ "$rel" == *$'\n'* ]]; then
+        printf 'Warning: not excluding environment with a newline in its path\n' >>"$log_file"
+        continue
+      fi
+      pattern="${anchor_prefix}${rel}/"
+      # rsync honors backslash escapes only in patterns that contain wildcards.
+      if [[ "$pattern" == *[*?[]* ]]; then
+        pattern="$(printf '%s' "$pattern" | sed 's/[][*?\\]/\\&/g')"
+      fi
+      printf '%s\n' "$pattern" >>"$exclude_file"
+      printf 'Excluding environment: %s\n' "$rel" >>"$log_file"
+      env_count=$((env_count + 1))
+    done < <(find "$src_root" -mindepth 1 -type d -exec test -e '{}/conda-meta' -o -e '{}/pyvenv.cfg' \; -print0 -prune 2>>"$log_file")
+    printf 'Excluded %s environment directories\n\n' "$env_count" >>"$log_file"
+    rsync_opts+=("--exclude-from=$exclude_file")
+  fi
+fi
+
+if [[ -n "$TD_RSYNC_OPTS" ]]; then
+  extra_opts=()
+  eval "extra_opts=($TD_RSYNC_OPTS)"
+  rsync_opts+=("${extra_opts[@]}")
+  unset extra_opts
+fi
+rsync_opts+=("$TD_SRC" "$TD_DEST")
 
 # Schedule the next run before rsync starts, so a time limit, node failure, or
 # preemption that kills this job cannot break the chain. afterany keeps it from

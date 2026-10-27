@@ -45,8 +45,13 @@ Optional keys:
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
 - `TD_LOG_DIR` – absolute base directory for this profile's logs; overrides the `TD_LOG_DIR` environment variable.
 - `TD_NOTIFY_MIN_INTERVAL` – minimum seconds between report emails for a profile (default `3600`; `0` disables). Reports inside the window are skipped and noted in the Slurm output.
+- `TD_EXCLUDE_ENVS` – `1` or `true` to skip Python/conda environments wherever they are and whatever they are named (see below).
 - `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
 - `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
+
+## Excluding Environments
+
+Name-based filters such as `--filter='- .conda'` miss environments created with arbitrary names (e.g. `conda env create -p my_code`). With `TD_EXCLUDE_ENVS=1`, each run first scans a local `TD_SRC` for directories containing `conda-meta/` or `pyvenv.cfg`, logs each one, and excludes it with a pattern anchored at the transfer root, ahead of any `TD_RSYNC_OPTS` filters. The scan does not descend into environments it finds. It is skipped with a warning when `TD_SRC` is remote. Environments already copied to the destination are not removed.
 
 ## Monitoring with healthchecks.io
 

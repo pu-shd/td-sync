@@ -356,3 +356,83 @@ run_job() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"TD_NOTIFY_MIN_INTERVAL must be a whole number of seconds"* ]]
 }
+
+# Builds a source tree with a conda env, a venv, an env nested inside an env,
+# and ordinary data, under $BATS_TEST_TMPDIR/envsrc/proj.
+make_env_tree() {
+  local root="$BATS_TEST_TMPDIR/envsrc/proj"
+  mkdir -p "$root/plain_named_env/conda-meta" "$root/plain_named_env/lib" \
+    "$root/plain_named_env/pkgs/inner/conda-meta" \
+    "$root/code/venv_like" "$root/data/results" "$root/odd[name]*env/conda-meta"
+  touch "$root/code/venv_like/pyvenv.cfg" "$root/data/results/table.csv" "$root/plain_named_env/lib/libbig.so"
+  printf '%s\n' "$root"
+}
+
+@test "TD_EXCLUDE_ENVS excludes directories that contain conda-meta or pyvenv.cfg" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envs "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  run_job envs
+  [ "$status" -eq 0 ]
+  grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT"
+  excludes="$(cat "$TD_MOCK_OUTPUT.exclude-from")"
+  [ "$(wc -l <<<"$excludes")" -eq 3 ]
+  grep -qxF '/plain_named_env/' <<<"$excludes"
+  grep -qxF '/code/venv_like/' <<<"$excludes"
+  grep -qxF '/odd\[name\]\*env/' <<<"$excludes"
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/envs_*.log | head -1)"
+  grep -q 'Excluded 3 environment directories' "$latest_log"
+}
+
+@test "environment excludes are anchored at the source basename without a trailing slash" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envbase "TD_SRC=$root" "TD_EXCLUDE_ENVS=1"
+  run_job envbase
+  [ "$status" -eq 0 ]
+  grep -qxF '/proj/plain_named_env/' "$TD_MOCK_OUTPUT.exclude-from"
+}
+
+@test "environment excludes come before user rsync filters" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envorder "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1" "TD_RSYNC_OPTS=\"--filter='+ *'\""
+  run_job envorder
+  rsync_line="$(grep '^rsync ' "$TD_MOCK_OUTPUT")"
+  before_user="${rsync_line%%--filter=+ \**}"
+  [[ "$before_user" == *"--exclude-from="* ]]
+}
+
+@test "environment detection is off by default" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envoff "TD_SRC=$root/"
+  run_job envoff
+  [ "$status" -eq 0 ]
+  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT"
+}
+
+@test "environment detection is skipped with a warning for a remote source" {
+  submit_profile_fixture envremote "TD_SRC=host:/data/src/" "TD_EXCLUDE_ENVS=1"
+  run_job envremote
+  [ "$status" -eq 0 ]
+  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT"
+  grep -q '^rsync ' "$TD_MOCK_OUTPUT"
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/envremote_*.log | head -1)"
+  grep -q 'TD_EXCLUDE_ENVS ignored' "$latest_log"
+}
+
+@test "real rsync skips detected environments and copies everything else" {
+  real_rsync="$(PATH="${PATH//$PROJECT_ROOT\/mocks\/bin/}" command -v rsync || true)"
+  [ -n "$real_rsync" ] || skip "real rsync not installed"
+  root="$(make_env_tree)"
+  dest="$BATS_TEST_TMPDIR/envdest"
+  mkdir -p "$dest"
+  submit_profile_fixture envreal "TD_SRC=$root/" "TD_DEST=$dest/" "TD_EXCLUDE_ENVS=1"
+  tools="$BATS_TEST_TMPDIR/tools"
+  mkdir -p "$tools"
+  for tool in sbatch squeue scancel; do ln -sf "$PROJECT_ROOT/mocks/bin/$tool" "$tools/$tool"; done
+  ln -sf "$real_rsync" "$tools/rsync"
+  run env PATH="$tools:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/envreal.job.sh"
+  [ "$status" -eq 0 ]
+  [[ -f "$dest/data/results/table.csv" ]]
+  [[ ! -e "$dest/plain_named_env" ]]
+  [[ ! -e "$dest/code/venv_like" ]]
+  [[ ! -e "$dest/odd[name]*env" ]]
+}
