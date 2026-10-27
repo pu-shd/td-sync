@@ -29,7 +29,8 @@ Optional profile settings:
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
   TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
   TD_NOTIFY_MIN_INTERVAL  Minimum seconds between report emails per profile (default: 3600; 0 disables).
-  TD_EXCLUDE_ENVS         When 1/true, skip any source directory containing conda-meta/ or pyvenv.cfg.
+  TD_EXCLUDE_ENVS         When 1/true, skip any source directory containing conda-meta/ or pyvenv.cfg,
+                          and the paths listed in RECORD files of pip --target installs.
   TD_HC_URL               healthchecks.io ping URL; pinged at start and with the exit status at the end.
   TD_RELAY_HOST           Host to send pings and report email through via ssh, for compute nodes
                           without internet or working mail (e.g. della9).
@@ -329,8 +330,10 @@ if [[ "$TD_DRY_RUN" == "1" ]]; then
 fi
 
 # Environments can have any name, so find them by their marker files and exclude
-# each root with a pattern anchored at the transfer root. These rules precede
-# TD_RSYNC_OPTS because rsync applies the first matching filter.
+# each root with a pattern anchored at the transfer root. Packages installed with
+# `pip install --target` have no environment root, so exclude exactly the
+# top-level paths their dist-info RECORD lists, leaving neighboring files alone.
+# These rules precede TD_RSYNC_OPTS because rsync applies the first matching filter.
 if [[ "$TD_EXCLUDE_ENVS" == "1" ]]; then
   if [[ "$TD_SRC" =~ ^[^/]*: ]]; then
     printf 'Warning: TD_EXCLUDE_ENVS ignored; cannot scan remote source %s\n\n' "$TD_SRC" >>"$log_file"
@@ -340,23 +343,71 @@ if [[ "$TD_EXCLUDE_ENVS" == "1" ]]; then
     if [[ "$TD_SRC" != */ ]]; then
       anchor_prefix="/$(basename "$src_root")"
     fi
-    env_count=0
-    while IFS= read -r -d '' env_dir; do
-      rel="${env_dir#"$src_root"}"
-      if [[ "$rel" == *$'\n'* ]]; then
-        printf 'Warning: not excluding environment with a newline in its path\n' >>"$log_file"
-        continue
-      fi
-      pattern="${anchor_prefix}${rel}/"
+
+    # Appends an anchored exclude for a path relative to the source root.
+    add_exclude() {
+      local pattern="${anchor_prefix}/$1"
       # rsync honors backslash escapes only in patterns that contain wildcards.
       if [[ "$pattern" == *[*?[]* ]]; then
         pattern="$(printf '%s' "$pattern" | sed 's/[][*?\\]/\\&/g')"
       fi
       printf '%s\n' "$pattern" >>"$exclude_file"
-      printf 'Excluding environment: %s\n' "$rel" >>"$log_file"
-      env_count=$((env_count + 1))
-    done < <(find "$src_root" -mindepth 1 -type d -exec test -e '{}/conda-meta' -o -e '{}/pyvenv.cfg' \; -print0 -prune 2>>"$log_file")
-    printf 'Excluded %s environment directories\n\n' "$env_count" >>"$log_file"
+    }
+
+    # Prints the distinct top-level paths a RECORD file lists, skipping paths
+    # outside the install directory and shared directories such as bin/.
+    record_tops() {
+      local line path top
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == \"* ]]; then
+          path="${line#\"}"
+          path="${path%%\"*}"
+        else
+          path="${line%%,*}"
+        fi
+        top="${path%%/*}"
+        case "$top" in
+          ''|.|..|bin|Scripts|include|lib|lib64|share|etc|man) continue ;;
+        esac
+        printf '%s\n' "$top"
+      done <"$1" | sort -u
+    }
+
+    env_count=0
+    pkg_path_count=0
+    while IFS= read -r -d '' entry; do
+      kind="${entry%%$'\t'*}"
+      rel="${entry#*$'\t'}"
+      if [[ "$rel" == *$'\n'* ]]; then
+        printf 'Warning: not excluding a path with a newline in it\n' >>"$log_file"
+        continue
+      fi
+      if [[ "$kind" == "env" ]]; then
+        add_exclude "$rel/"
+        printf 'Excluding environment: /%s\n' "$rel" >>"$log_file"
+        env_count=$((env_count + 1))
+        continue
+      fi
+      record="$src_root/$rel/RECORD"
+      if [[ ! -f "$record" ]]; then
+        continue
+      fi
+      parent="$(dirname "$rel")"
+      if [[ "$parent" == "." ]]; then
+        parent=""
+      else
+        parent="$parent/"
+      fi
+      pkg_paths=0
+      while IFS= read -r top; do
+        add_exclude "${parent}${top}"
+        pkg_paths=$((pkg_paths + 1))
+      done < <(record_tops "$record")
+      pkg_name="$(basename "$rel")"
+      printf 'Excluding pip-installed %s in %s (%s paths)\n' "${pkg_name%.dist-info}" "${parent%/}" "$pkg_paths" >>"$log_file"
+      pkg_path_count=$((pkg_path_count + pkg_paths))
+    done < <(find "$src_root" -mindepth 1 -type d \( \( -exec test -e '{}/conda-meta' -o -e '{}/pyvenv.cfg' \; -printf 'env\t%P\0' -prune \) -o \( -name '*.dist-info' -printf 'pkg\t%P\0' -prune \) \) 2>>"$log_file")
+    printf 'Excluded %s environment directories and %s pip-installed package paths\n\n' "$env_count" "$pkg_path_count" >>"$log_file"
     rsync_opts+=("--exclude-from=$exclude_file")
   fi
 fi

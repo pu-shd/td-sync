@@ -436,3 +436,63 @@ make_env_tree() {
   [[ ! -e "$dest/code/venv_like" ]]
   [[ ! -e "$dest/odd[name]*env" ]]
 }
+
+# Builds a project with a `pip install --target` directory mixed with user files,
+# under $BATS_TEST_TMPDIR/pipsrc/proj.
+make_pip_tree() {
+  local root="$BATS_TEST_TMPDIR/pipsrc/proj"
+  local tgt="$root/exp/9"
+  mkdir -p "$tgt/pkg/sub" "$tgt/pkg.libs" "$tgt/pkg-1.0.dist-info" "$tgt/we,ird" "$tgt/bin" \
+    "$root/exp/fom.egg-info" "$root/env1/conda-meta" "$root/env1/lib/dep-2.0.dist-info"
+  touch "$tgt/pkg/__init__.py" "$tgt/pkg/sub/core.so" "$tgt/pkg.libs/libx.so" "$tgt/mod.py" \
+    "$tgt/we,ird/f" "$tgt/bin/tool" "$tgt/keepme.py" "$root/exp/run.py" "$root/exp/fom.egg-info/PKG-INFO"
+  cat >"$tgt/pkg-1.0.dist-info/RECORD" <<'RECORD'
+pkg/__init__.py,sha256=abc,10
+pkg/sub/core.so,sha256=def,20
+pkg.libs/libx.so,,
+mod.py,sha256=ghi,5
+"we,ird/f",,
+bin/tool,,
+../../bin/f2py,,
+pkg-1.0.dist-info/RECORD,,
+RECORD
+  printf 'dep-2.0.dist-info/RECORD,,\n' >"$root/env1/lib/dep-2.0.dist-info/RECORD"
+  printf '%s\n' "$root"
+}
+
+@test "TD_EXCLUDE_ENVS excludes exactly the paths pip recorded for --target installs" {
+  root="$(make_pip_tree)"
+  submit_profile_fixture pip "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  run_job pip
+  [ "$status" -eq 0 ]
+  excludes="$(cat "$TD_MOCK_OUTPUT.exclude-from")"
+  expected=$'/env1/\n/exp/9/mod.py\n/exp/9/pkg\n/exp/9/pkg-1.0.dist-info\n/exp/9/pkg.libs\n/exp/9/we,ird'
+  [ "$(sort <<<"$excludes")" = "$expected" ]
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/pip_*.log | head -1)"
+  grep -q 'Excluding pip-installed pkg-1.0 in exp/9 (5 paths)' "$latest_log"
+}
+
+@test "real rsync skips pip-installed packages but keeps neighboring user files" {
+  real_rsync="$(PATH="${PATH//$PROJECT_ROOT\/mocks\/bin/}" command -v rsync || true)"
+  [ -n "$real_rsync" ] || skip "real rsync not installed"
+  root="$(make_pip_tree)"
+  dest="$BATS_TEST_TMPDIR/pipdest"
+  mkdir -p "$dest"
+  submit_profile_fixture pipreal "TD_SRC=$root/" "TD_DEST=$dest/" "TD_EXCLUDE_ENVS=1"
+  tools="$BATS_TEST_TMPDIR/tools"
+  mkdir -p "$tools"
+  for tool in sbatch squeue scancel; do ln -sf "$PROJECT_ROOT/mocks/bin/$tool" "$tools/$tool"; done
+  ln -sf "$real_rsync" "$tools/rsync"
+  run env PATH="$tools:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/pipreal.job.sh"
+  [ "$status" -eq 0 ]
+  [[ -f "$dest/exp/9/keepme.py" ]]
+  [[ -f "$dest/exp/9/bin/tool" ]]
+  [[ -f "$dest/exp/run.py" ]]
+  [[ -f "$dest/exp/fom.egg-info/PKG-INFO" ]]
+  [[ ! -e "$dest/exp/9/pkg" ]]
+  [[ ! -e "$dest/exp/9/pkg.libs" ]]
+  [[ ! -e "$dest/exp/9/mod.py" ]]
+  [[ ! -e "$dest/exp/9/pkg-1.0.dist-info" ]]
+  [[ ! -e "$dest/exp/9/we,ird" ]]
+  [[ ! -e "$dest/env1" ]]
+}

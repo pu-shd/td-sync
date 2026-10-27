@@ -51,7 +51,7 @@ Optional keys:
 
 ## Excluding Environments
 
-Name-based filters such as `--filter='- .conda'` miss environments created with arbitrary names (e.g. `conda env create -p my_code`). With `TD_EXCLUDE_ENVS=1`, each run first scans a local `TD_SRC` for directories containing `conda-meta/` or `pyvenv.cfg`, logs each one, and excludes it with a pattern anchored at the transfer root, ahead of any `TD_RSYNC_OPTS` filters. The scan does not descend into environments it finds. It is skipped with a warning when `TD_SRC` is remote. Environments already copied to the destination are not removed.
+Name-based filters such as `--filter='- .conda'` miss environments created with arbitrary names (e.g. `conda env create -p my_code`). With `TD_EXCLUDE_ENVS=1`, each run first scans a local `TD_SRC` for directories containing `conda-meta/` or `pyvenv.cfg`, logs each one, and excludes it with a pattern anchored at the transfer root, ahead of any `TD_RSYNC_OPTS` filters. The same scan finds packages installed with `pip install --target` (which have no environment root) by their `*.dist-info/RECORD` files and excludes exactly the top-level paths each RECORD lists (e.g. `numpy/`, `numpy.libs/`, `numpy-2.5.2.dist-info/`), leaving other files in that directory untouched; shared directories such as `bin/` are not excluded wholesale. The scan does not descend into environments it finds. It is skipped with a warning when `TD_SRC` is remote. Environments already copied to the destination are not removed.
 
 ## Monitoring with healthchecks.io
 
