@@ -39,7 +39,7 @@ Each profile is a simple `.env` file. Required keys:
 
 Optional keys:
 
-- `TD_NOTIFY` – comma-separated email recipients.
+- `TD_NOTIFY` – comma-separated email recipients for the per-run report. The first recipient is also passed to Slurm (`--mail-type=FAIL,TIME_LIMIT_90`), so failures, timeouts, and approaching time limits are emailed by Slurm even when the job is killed before it can report.
 - `TD_DRY_RUN` – `1` or `true` for `rsync --dry-run`.
 - `TD_SLURM_RUNTIME` – job runtime (`HH:MM:SS`, defaults to `01:00:00`).
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
@@ -52,6 +52,8 @@ Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacin
 ## Logs
 
 Logs are always written to a `td-sync/` subdirectory of the log base directory (the profile's `TD_LOG_DIR`, else the `TD_LOG_DIR` environment variable, else `$PWD/logs`). Pointing `TD_LOG_DIR` at a shared directory such as `/scratch/gpfs/GROUP/logs` is therefore safe: other files there are never touched.
+
+Slurm's own output for each job goes to `<profile>_slurm-<jobid>.out` beside the rsync logs rather than to the submission directory.
 
 If `TD_LOG_RETENTION_DAYS` is set, Tiny Data Sync purges `*.log` and `*.out` files older than the configured number of days from that `td-sync/` subdirectory only, each time the script runs.
 

@@ -376,7 +376,17 @@ submit_profile() {
 
   local job_name="td-sync-$sanitized"
   local sbatch_args
-  sbatch_args=("--job-name=$job_name" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT")
+  sbatch_args=("--job-name=$job_name" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT" "--output=$log_dir/${sanitized}_slurm-%j.out")
+
+  # Slurm sends this mail itself, so it still arrives when a job is killed before
+  # the job script can report. --mail-user takes a single address.
+  if [[ -n "${TD_NOTIFY:-}" ]]; then
+    local first_recipient="${TD_NOTIFY%%,*}"
+    first_recipient="$(printf '%s' "$first_recipient" | xargs)"
+    if [[ -n "$first_recipient" ]]; then
+      sbatch_args+=("--mail-type=FAIL,TIME_LIMIT_90" "--mail-user=$first_recipient")
+    fi
+  fi
 
   write_job_script "$profile_name" "$sanitized" "$job_script_path" "$log_dir" "$MAILER_CMD" "${sbatch_args[@]}"
 

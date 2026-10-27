@@ -220,3 +220,28 @@ run_job() {
   [[ "$output" == *"unable to query squeue"* ]]
   ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
 }
+
+@test "Slurm emails the first recipient on failure and writes output next to the logs" {
+  config_dir="$BATS_TEST_TMPDIR/config-slurmmail"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/slurmmail.env"
+  printf 'TD_NOTIFY="a@example.org, b@example.org"\n' >>"$config_dir/slurmmail.env"
+  export TD_CONFIG_DIR="$config_dir"
+  export TD_LOG_DIR="$BATS_TEST_TMPDIR/logs-slurmmail"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -eq 0 ]
+  grep -qF -- "--mail-type=FAIL,TIME_LIMIT_90 --mail-user=a@example.org" "$TD_MOCK_OUTPUT"
+  grep -qF -- "--output=$TD_LOG_DIR/td-sync/slurmmail_slurm-%j.out" "$TD_MOCK_OUTPUT"
+  rm -f "$TD_MOCK_OUTPUT"
+  run_job slurmmail
+  [ "$status" -eq 0 ]
+  grep -q '^sbatch --parsable .*--mail-type=FAIL,TIME_LIMIT_90 --mail-user=a@example.org' "$TD_MOCK_OUTPUT"
+  grep -qF -- "--output=$TD_LOG_DIR/td-sync/slurmmail_slurm-%j.out" "$TD_MOCK_OUTPUT"
+}
+
+@test "no Slurm mail options without TD_NOTIFY" {
+  submit_profile_fixture nomail
+  run "$PROJECT_ROOT/bin/td-sync"
+  ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT"
+  grep -q -- '--output=' "$TD_MOCK_OUTPUT"
+}
