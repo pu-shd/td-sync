@@ -7,7 +7,9 @@ The script ingests `.env` configuration profiles and produces self-resubmitting 
 ## Features
 
 - Auto-discovers configuration profiles from `$HOME/.config/td-sync.d` or `$TD_CONFIG_DIR`.
-- Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=+TD_SUBMIT_INTERVAL`.
+- Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=now+TD_SUBMIT_INTERVAL`.
+- Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run.
+- Skips submitting a profile that already has a job queued, so re-running `td-sync` never creates duplicate schedules.
 - Writes logs to a dedicated `td-sync/` subdirectory of `$TD_LOG_DIR` (default `$PWD/logs`), with optional retention via `TD_LOG_RETENTION_DAYS`.
 - Provides mock `sbatch`, `mail`, and `sendmail` utilities for isolated testing via `TD_TEST_MODE`.
 - Ships a Docker test environment with `bats-core` for unit tests.
@@ -45,7 +47,7 @@ Optional keys:
 
 ## Test Mode
 
-Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacing `sbatch`, `mail`, and `sendmail` with test doubles. Use this when running unit tests or developing on a system without Slurm or a mail transfer agent.
+Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacing `sbatch`, `squeue`, `scancel`, `rsync`, `mail`, and `sendmail` with test doubles. Use this when running unit tests or developing on a system without Slurm or a mail transfer agent.
 
 ## Logs
 

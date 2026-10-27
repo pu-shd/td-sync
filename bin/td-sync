@@ -197,6 +197,8 @@ write_job_script() {
   local job_script_path="$3"
   local log_dir="$4"
   local mailer_cmd="$5"
+  shift 5
+  local sbatch_args=("$@")
 
   local dry_flag="0"
   if is_truthy "${TD_DRY_RUN:-}"; then
@@ -207,8 +209,6 @@ write_job_script() {
   local td_src_escaped
   local td_dest_escaped
   local td_notify_escaped
-  local td_runtime_escaped
-  local td_account_escaped
   local td_interval_escaped
   local log_dir_escaped
   local log_base_escaped
@@ -220,8 +220,6 @@ write_job_script() {
   printf -v td_src_escaped '%q' "${TD_SRC:-}"
   printf -v td_dest_escaped '%q' "${TD_DEST:-}"
   printf -v td_notify_escaped '%q' "${TD_NOTIFY:-}"
-  printf -v td_runtime_escaped '%q' "${TD_SLURM_RUNTIME:-}"
-  printf -v td_account_escaped '%q' "${TD_SLURM_ACCOUNT:-}"
   printf -v td_interval_escaped '%q' "${TD_SUBMIT_INTERVAL:-}"
   printf -v log_dir_escaped '%q' "$log_dir"
   printf -v log_base_escaped '%q' "$profile_label"
@@ -236,15 +234,16 @@ write_job_script() {
     printf 'TD_DEST=%s\n' "$td_dest_escaped"
     printf 'TD_NOTIFY=%s\n' "$td_notify_escaped"
     printf 'TD_DRY_RUN=%s\n' "$dry_flag"
-    printf 'TD_SLURM_RUNTIME=%s\n' "$td_runtime_escaped"
-    printf 'TD_SLURM_ACCOUNT=%s\n' "$td_account_escaped"
     printf 'TD_SUBMIT_INTERVAL=%s\n' "$td_interval_escaped"
     printf 'TD_LOG_DIR=%s\n' "$log_dir_escaped"
   printf 'LOG_BASENAME=%s\n' "$log_base_escaped"
     printf 'MAILER_CMD=%s\n' "$mailer_escaped"
     printf 'JOB_NAME=%s\n' "$job_name_escaped"
     printf 'SELF_PATH=%s\n' "$self_path_escaped"
-    printf 'TD_RSYNC_OPTS=%s\n\n' "$td_rsync_opts_escaped"
+    printf 'TD_RSYNC_OPTS=%s\n' "$td_rsync_opts_escaped"
+    printf 'SBATCH_ARGS=('
+    printf '%q ' "${sbatch_args[@]}"
+    printf ')\n\n'
     cat <<'EOF'
 mkdir -p "${TD_LOG_DIR}"
 
@@ -265,38 +264,50 @@ if [[ -n "$TD_RSYNC_OPTS" ]]; then
 fi
 rsync_opts+=("$TD_SRC" "$TD_DEST")
 
-set +e
 {
   printf 'Tiny Data Sync job: %s\n' "$JOB_NAME"
   printf 'Started: %s\n' "$timestamp"
   printf 'Source: %s\n' "$TD_SRC"
   printf 'Destination: %s\n' "$TD_DEST"
   printf 'Dry run: %s\n\n' "$TD_DRY_RUN"
-  rsync "${rsync_opts[@]}"
-} &>"$log_file"
+} >"$log_file"
+
+# Schedule the next run before rsync starts, so a time limit, node failure, or
+# preemption that kills this job cannot break the chain. afterany keeps it from
+# starting while this run is still going.
+next_job_id=""
+requeue_note="Requeue interval not set"
+if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
+  dependency_args=()
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    dependency_args=("--dependency=afterany:${SLURM_JOB_ID}")
+  fi
+  if next_job_id="$(sbatch --parsable "${SBATCH_ARGS[@]}" ${dependency_args[@]+"${dependency_args[@]}"} --begin="now+${TD_SUBMIT_INTERVAL}" "$SELF_PATH")"; then
+    next_job_id="${next_job_id%%;*}"
+    requeue_note="Next run scheduled after $TD_SUBMIT_INTERVAL (job $next_job_id)"
+  else
+    next_job_id=""
+    printf 'Unable to requeue job with interval %s\n' "$TD_SUBMIT_INTERVAL" >>"$log_file"
+    requeue_note="Failed to schedule next run; check logs"
+  fi
+fi
+
+set +e
+rsync "${rsync_opts[@]}" &>>"$log_file"
 rsync_status=$?
 set -e
 
-requeue_note="Requeue not requested"
-
 if [[ $rsync_status -ne 0 ]]; then
   printf 'rsync exited with status %s\n' "$rsync_status" >>"$log_file"
-  requeue_note="Job not requeued; rsync exited with status $rsync_status"
-fi
-
-if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
-  if [[ $rsync_status -eq 0 ]]; then
-    if sbatch --job-name="$JOB_NAME" --time="$TD_SLURM_RUNTIME" --account="$TD_SLURM_ACCOUNT" --begin="now+${TD_SUBMIT_INTERVAL}" "$SELF_PATH"; then
-      requeue_note="Next run scheduled after $TD_SUBMIT_INTERVAL"
+  if [[ -n "$next_job_id" ]]; then
+    if scancel "$next_job_id"; then
+      requeue_note="Next run (job $next_job_id) cancelled; rsync exited with status $rsync_status"
     else
-      printf 'Unable to requeue job with interval %s\n' "$TD_SUBMIT_INTERVAL" >>"$log_file"
-      requeue_note="Failed to schedule next run; check logs"
+      requeue_note="rsync exited with status $rsync_status but cancelling next run (job $next_job_id) failed"
     fi
   else
     requeue_note="Job not requeued; rsync exited with status $rsync_status"
   fi
-else
-  requeue_note="Requeue interval not set"
 fi
 
 {
@@ -363,10 +374,22 @@ submit_profile() {
   mkdir -p "$jobs_dir"
   local job_script_path="$jobs_dir/$sanitized.job.sh"
 
-  write_job_script "$profile_name" "$sanitized" "$job_script_path" "$log_dir" "$MAILER_CMD"
-
+  local job_name="td-sync-$sanitized"
   local sbatch_args
-  sbatch_args=("--job-name=td-sync-$sanitized" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT")
+  sbatch_args=("--job-name=$job_name" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT")
+
+  write_job_script "$profile_name" "$sanitized" "$job_script_path" "$log_dir" "$MAILER_CMD" "${sbatch_args[@]}"
+
+  # Each run keeps its successor queued, so a queued job means the chain is alive.
+  local queued
+  if ! queued="$(squeue -h -u "${USER:-$(id -un)}" -n "$job_name" -o %i)"; then
+    log_error "[$profile_name] unable to query squeue; not submitting"
+    return 1
+  fi
+  if [[ -n "$queued" ]]; then
+    log_info "Profile $profile_name already queued (job ${queued//$'\n'/, }); refreshed $job_script_path for future runs. Use scancel first to restart it now."
+    return 0
+  fi
 
   log_info "Submitting profile $profile_name via $job_script_path"
   sbatch "${sbatch_args[@]}" "$job_script_path"
@@ -391,6 +414,10 @@ main() {
     else
       fatal "sbatch not found in PATH. Install Slurm or run in TD_TEST_MODE for testing."
     fi
+  fi
+
+  if ! require_command squeue; then
+    fatal "squeue not found in PATH. Install Slurm or run in TD_TEST_MODE for testing."
   fi
 
   if ! require_command rsync; then
