@@ -316,3 +316,43 @@ run_job() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"TD_RELAY_HOST must be a plain host name"* ]]
 }
+
+@test "report email is throttled per profile" {
+  submit_profile_fixture throttle "TD_NOTIFY=a@example.org,b@example.org"
+  run_job throttle
+  [ "$status" -eq 0 ]
+  run_job throttle
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"report email suppressed"* ]]
+  [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
+}
+
+@test "TD_NOTIFY_MIN_INTERVAL=0 disables email throttling" {
+  submit_profile_fixture nothrottle "TD_NOTIFY=a@example.org" "TD_NOTIFY_MIN_INTERVAL=0"
+  run_job nothrottle
+  run_job nothrottle
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
+}
+
+@test "failed email does not start the throttle window" {
+  submit_profile_fixture mailfail "TD_NOTIFY=a@example.org"
+  export TD_MOCK_MAIL_STATUS=1
+  run_job mailfail
+  [ "$status" -eq 0 ]
+  unset TD_MOCK_MAIL_STATUS
+  run_job mailfail
+  [[ "$output" != *"suppressed"* ]]
+  [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
+}
+
+@test "non-numeric TD_NOTIFY_MIN_INTERVAL is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badthrottle"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badthrottle.env"
+  printf 'TD_NOTIFY_MIN_INTERVAL=1h\n' >>"$config_dir/badthrottle.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_NOTIFY_MIN_INTERVAL must be a whole number of seconds"* ]]
+}

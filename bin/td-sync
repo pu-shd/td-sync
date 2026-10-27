@@ -28,6 +28,7 @@ Optional profile settings:
   TD_DRY_RUN              When 1/true, perform rsync dry-run.
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
   TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
+  TD_NOTIFY_MIN_INTERVAL  Minimum seconds between report emails per profile (default: 3600; 0 disables).
   TD_HC_URL               healthchecks.io ping URL; pinged at start and with the exit status at the end.
   TD_RELAY_HOST           Host to send pings and report email through via ssh, for compute nodes
                           without internet or working mail (e.g. della9).
@@ -141,7 +142,7 @@ purge_old_logs() {
 load_profile() {
   local profile_path="$1"
 
-  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST
+  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL
   TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
@@ -175,6 +176,12 @@ validate_profile() {
 
   if [[ -z "${TD_LOG_DIR:-}" || "$TD_LOG_DIR" != /* ]]; then
     log_error "[$profile_name] TD_LOG_DIR must be an absolute path"
+    return 1
+  fi
+
+  TD_NOTIFY_MIN_INTERVAL="${TD_NOTIFY_MIN_INTERVAL:-3600}"
+  if ! [[ "$TD_NOTIFY_MIN_INTERVAL" =~ ^[0-9]+$ ]]; then
+    log_error "[$profile_name] TD_NOTIFY_MIN_INTERVAL must be a whole number of seconds"
     return 1
   fi
 
@@ -263,6 +270,7 @@ write_job_script() {
     printf 'JOB_NAME=%s\n' "$job_name_escaped"
     printf 'SELF_PATH=%s\n' "$self_path_escaped"
     printf 'TD_RSYNC_OPTS=%s\n' "$td_rsync_opts_escaped"
+    printf 'TD_NOTIFY_MIN_INTERVAL=%s\n' "$TD_NOTIFY_MIN_INTERVAL"
     printf 'TD_HC_URL=%s\n' "$td_hc_url_escaped"
     printf 'TD_RELAY_HOST=%s\n' "$td_relay_host_escaped"
     printf '# shellcheck disable=SC2054\n'
@@ -393,15 +401,36 @@ send_report() {
   fi
 }
 
+# Throttle report email per profile; the stamp holds the epoch of the last sent report.
+email_stamp="${TD_LOG_DIR}/.${LOG_BASENAME}.last-email"
+email_throttled() {
+  local last now
+  [[ -f "$email_stamp" ]] || return 1
+  last="$(cat "$email_stamp" 2>/dev/null || true)"
+  [[ "$last" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( now - last < TD_NOTIFY_MIN_INTERVAL ))
+}
+
 if [[ -n "$TD_NOTIFY" && -n "$MAILER_CMD" ]]; then
-  IFS=',' read -r -a recipients <<<"$TD_NOTIFY"
-  for recipient in "${recipients[@]}"; do
-    recipient="$(printf '%s' "$recipient" | xargs)"
-    [[ -z "$recipient" ]] && continue
-    if ! send_report "$recipient"; then
-      printf 'Warning: unable to email report to %s\n' "$recipient" >&2
+  if email_throttled; then
+    printf 'Notice: report email suppressed; last one was sent less than %s seconds ago\n' "$TD_NOTIFY_MIN_INTERVAL" >&2
+  else
+    email_sent=0
+    IFS=',' read -r -a recipients <<<"$TD_NOTIFY"
+    for recipient in "${recipients[@]}"; do
+      recipient="$(printf '%s' "$recipient" | xargs)"
+      [[ -z "$recipient" ]] && continue
+      if send_report "$recipient"; then
+        email_sent=1
+      else
+        printf 'Warning: unable to email report to %s\n' "$recipient" >&2
+      fi
+    done
+    if (( email_sent )); then
+      date +%s >"$email_stamp" || printf 'Warning: unable to record email time in %s\n' "$email_stamp" >&2
     fi
-  done
+  fi
 fi
 
 if [[ $rsync_status -ne 0 ]]; then

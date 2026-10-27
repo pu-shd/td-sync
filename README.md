@@ -44,6 +44,7 @@ Optional keys:
 - `TD_SLURM_RUNTIME` – job runtime (`HH:MM:SS`, defaults to `01:00:00`).
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
 - `TD_LOG_DIR` – absolute base directory for this profile's logs; overrides the `TD_LOG_DIR` environment variable.
+- `TD_NOTIFY_MIN_INTERVAL` – minimum seconds between report emails for a profile (default `3600`; `0` disables). Reports inside the window are skipped and noted in the Slurm output.
 - `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
 - `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
 
