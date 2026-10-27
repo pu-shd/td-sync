@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
+  {
+    printf 'curl'
+    printf ' [%s]' "$@"
+    printf '\n'
+  } >>"$TD_MOCK_OUTPUT"
+fi
+
+for arg in "$@"; do
+  if [[ "$arg" == "@-" && -n "${TD_MOCK_OUTPUT:-}" ]]; then
+    cat >>"${TD_MOCK_OUTPUT}.curl-body"
+    printf '\n--- end of body ---\n' >>"${TD_MOCK_OUTPUT}.curl-body"
+  fi
+done
+
+exit "${TD_MOCK_CURL_STATUS:-0}"

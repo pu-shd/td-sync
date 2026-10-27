@@ -245,3 +245,74 @@ run_job() {
   ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT"
   grep -q -- '--output=' "$TD_MOCK_OUTPUT"
 }
+
+@test "healthchecks gets a start ping and an exit-status ping with the summary" {
+  submit_profile_fixture hc "TD_HC_URL=https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/"
+  run_job hc
+  [ "$status" -eq 0 ]
+  start_line="$(grep -n 'curl .*\[https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/start\]' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  rsync_line="$(grep -n '^rsync ' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  [ -n "$start_line" ]
+  [ "$start_line" -lt "$rsync_line" ]
+  grep -q 'curl .*\[https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/0\]' "$TD_MOCK_OUTPUT"
+  grep -q 'Rsync exit status: 0' "$TD_MOCK_OUTPUT.curl-body"
+}
+
+@test "healthchecks receives the rsync exit status on failure" {
+  submit_profile_fixture hcfail "TD_HC_URL=https://hc-ping.com/abc"
+  export TD_MOCK_RSYNC_STATUS=23
+  run_job hcfail
+  [ "$status" -eq 23 ]
+  grep -q 'curl .*\[https://hc-ping.com/abc/23\]' "$TD_MOCK_OUTPUT"
+}
+
+@test "healthchecks is told to fail when the next run cannot be scheduled" {
+  submit_profile_fixture hcnoqueue "TD_HC_URL=https://hc-ping.com/abc"
+  export TD_MOCK_SBATCH_STATUS=1
+  run_job hcnoqueue
+  grep -q 'curl .*\[https://hc-ping.com/abc/fail\]' "$TD_MOCK_OUTPUT"
+}
+
+@test "pings and mail go through TD_RELAY_HOST with arguments intact" {
+  submit_profile_fixture relay "TD_HC_URL=https://hc-ping.com/abc" "TD_RELAY_HOST=della9" "TD_NOTIFY=ops@example.org"
+  run_job relay
+  [ "$status" -eq 0 ]
+  grep -q '^ssh della9 .*curl .*hc-ping.com/abc/start' "$TD_MOCK_OUTPUT"
+  grep -q '^ssh della9 .*curl .*hc-ping.com/abc/0' "$TD_MOCK_OUTPUT"
+  grep -q '^ssh della9 .*mail' "$TD_MOCK_OUTPUT"
+  grep -qxF 'mail [-s] [Tiny Data Sync results for td-sync-relay] [ops@example.org]' "$TD_MOCK_OUTPUT"
+  grep -q 'Rsync exit status: 0' "$TD_MOCK_OUTPUT.curl-body"
+}
+
+@test "unreachable relay, ping, or mailer never fails the job or the schedule" {
+  submit_profile_fixture flaky "TD_HC_URL=https://hc-ping.com/abc" "TD_RELAY_HOST=della9" "TD_NOTIFY=ops@example.org"
+  export TD_MOCK_SSH_STATUS=255
+  run_job flaky
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"healthchecks ping /start failed"* ]]
+  [[ "$output" == *"unable to email report to ops@example.org"* ]]
+  grep -q '^sbatch --parsable' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+}
+
+@test "unsafe TD_HC_URL is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badhc"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badhc.env"
+  printf 'TD_HC_URL='"'"'https://hc-ping.com/x;touch /tmp/pwned'"'"'\n' >>"$config_dir/badhc.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_HC_URL must be an https:// URL"* ]]
+}
+
+@test "unsafe TD_RELAY_HOST is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badrelay"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badrelay.env"
+  printf 'TD_RELAY_HOST=-oProxyCommand=evil\n' >>"$config_dir/badrelay.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_RELAY_HOST must be a plain host name"* ]]
+}

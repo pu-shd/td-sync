@@ -28,6 +28,9 @@ Optional profile settings:
   TD_DRY_RUN              When 1/true, perform rsync dry-run.
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
   TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
+  TD_HC_URL               healthchecks.io ping URL; pinged at start and with the exit status at the end.
+  TD_RELAY_HOST           Host to send pings and report email through via ssh, for compute nodes
+                          without internet or working mail (e.g. della9).
 
 The script inspects all *.env profiles within TD_CONFIG_DIR, ensures each meets the minimum
 requirements, generates a Slurm batch script per profile, and submits it. Submitted jobs
@@ -138,7 +141,7 @@ purge_old_logs() {
 load_profile() {
   local profile_path="$1"
 
-  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS
+  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST
   TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
@@ -173,6 +176,21 @@ validate_profile() {
   if [[ -z "${TD_LOG_DIR:-}" || "$TD_LOG_DIR" != /* ]]; then
     log_error "[$profile_name] TD_LOG_DIR must be an absolute path"
     return 1
+  fi
+
+  if [[ -n "${TD_HC_URL:-}" ]]; then
+    TD_HC_URL="${TD_HC_URL%/}"
+    if ! [[ "$TD_HC_URL" =~ ^https://[A-Za-z0-9._~/-]+$ ]]; then
+      log_error "[$profile_name] TD_HC_URL must be an https:// URL containing only letters, digits, and ._~/-"
+      return 1
+    fi
+  fi
+
+  if [[ -n "${TD_RELAY_HOST:-}" ]]; then
+    if ! [[ "$TD_RELAY_HOST" =~ ^[A-Za-z0-9_][A-Za-z0-9._@-]*$ ]]; then
+      log_error "[$profile_name] TD_RELAY_HOST must be a plain host name (optionally user@host)"
+      return 1
+    fi
   fi
 
   if [[ -n "${TD_NOTIFY:-}" ]]; then
@@ -215,6 +233,8 @@ write_job_script() {
   local job_name_escaped
   local self_path_escaped
   local td_rsync_opts_escaped
+  local td_hc_url_escaped
+  local td_relay_host_escaped
 
   printf -v mailer_escaped '%q' "$mailer_cmd"
   printf -v td_src_escaped '%q' "${TD_SRC:-}"
@@ -226,6 +246,8 @@ write_job_script() {
   printf -v job_name_escaped '%q' "td-sync-$sanitized_name"
   printf -v self_path_escaped '%q' "$job_script_path"
   printf -v td_rsync_opts_escaped '%q' "${TD_RSYNC_OPTS:-}"
+  printf -v td_hc_url_escaped '%q' "${TD_HC_URL:-}"
+  printf -v td_relay_host_escaped '%q' "${TD_RELAY_HOST:-}"
 
   {
     printf '#!/usr/bin/env bash\n'
@@ -241,6 +263,9 @@ write_job_script() {
     printf 'JOB_NAME=%s\n' "$job_name_escaped"
     printf 'SELF_PATH=%s\n' "$self_path_escaped"
     printf 'TD_RSYNC_OPTS=%s\n' "$td_rsync_opts_escaped"
+    printf 'TD_HC_URL=%s\n' "$td_hc_url_escaped"
+    printf 'TD_RELAY_HOST=%s\n' "$td_relay_host_escaped"
+    printf '# shellcheck disable=SC2054\n'
     printf 'SBATCH_ARGS=('
     printf '%q ' "${sbatch_args[@]}"
     printf ')\n\n'
@@ -251,6 +276,28 @@ timestamp="$(date +"%Y%m%dT%H%M%S")"
 log_file="${TD_LOG_DIR}/${LOG_BASENAME}_${timestamp}.log"
 summary_file="$(mktemp)"
 trap 'rm -f "$summary_file"' EXIT
+
+# Compute nodes may have no internet or working mail; when TD_RELAY_HOST is set,
+# run outbound commands there over ssh, the same way rsync reaches a remote host.
+run_outbound() {
+  if [[ -n "$TD_RELAY_HOST" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+      "$TD_RELAY_HOST" "$(printf '%q ' "$@")"
+  else
+    "$@"
+  fi
+}
+
+# Reads the ping body from stdin. A failed ping is reported but never fatal.
+hc_ping() {
+  local suffix="$1"
+  [[ -n "$TD_HC_URL" ]] || return 0
+  if ! run_outbound curl -fsS -m 30 --retry 3 -o /dev/null --data-binary @- "${TD_HC_URL}${suffix}"; then
+    printf 'Warning: healthchecks ping %s failed\n' "$suffix" >&2
+  fi
+}
+
+hc_ping /start </dev/null
 
 rsync_opts=("-av")
 if [[ "$TD_DRY_RUN" == "1" ]]; then
@@ -324,19 +371,35 @@ fi
   tail -n 200 "$log_file"
 } >"$summary_file"
 
+if [[ $rsync_status -ne 0 ]]; then
+  hc_suffix="/$rsync_status"
+elif [[ -n "$TD_SUBMIT_INTERVAL" && -z "$next_job_id" ]]; then
+  hc_suffix="/fail"
+else
+  hc_suffix="/0"
+fi
+hc_ping "$hc_suffix" < <(head -c 100000 "$summary_file")
+
+send_report() {
+  local recipient="$1"
+  if [[ "$MAILER_CMD" == *sendmail ]]; then
+    {
+      printf 'To: %s\n' "$recipient"
+      printf 'Subject: Tiny Data Sync results for %s\n\n' "$JOB_NAME"
+      cat "$summary_file"
+    } | run_outbound "$MAILER_CMD" "$recipient"
+  else
+    run_outbound "$MAILER_CMD" -s "Tiny Data Sync results for $JOB_NAME" "$recipient" <"$summary_file"
+  fi
+}
+
 if [[ -n "$TD_NOTIFY" && -n "$MAILER_CMD" ]]; then
   IFS=',' read -r -a recipients <<<"$TD_NOTIFY"
   for recipient in "${recipients[@]}"; do
     recipient="$(printf '%s' "$recipient" | xargs)"
     [[ -z "$recipient" ]] && continue
-    if [[ "$MAILER_CMD" == *sendmail ]]; then
-      {
-        printf 'To: %s\n' "$recipient"
-        printf 'Subject: Tiny Data Sync results for %s\n\n' "$JOB_NAME"
-        cat "$summary_file"
-      } | "$MAILER_CMD" "$recipient"
-    else
-      "$MAILER_CMD" -s "Tiny Data Sync results for $JOB_NAME" "$recipient" <"$summary_file"
+    if ! send_report "$recipient"; then
+      printf 'Warning: unable to email report to %s\n' "$recipient" >&2
     fi
   done
 fi

@@ -2,7 +2,12 @@
 set -euo pipefail
 
 if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
-  printf 'mail %s\n' "$*" >>"$TD_MOCK_OUTPUT"
+  {
+    printf 'mail'
+    printf ' [%s]' "$@"
+    printf '\n'
+  } >>"$TD_MOCK_OUTPUT"
 fi
 
 cat >/dev/null 2>&1 || true
+exit "${TD_MOCK_MAIL_STATUS:-0}"

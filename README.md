@@ -44,10 +44,22 @@ Optional keys:
 - `TD_SLURM_RUNTIME` – job runtime (`HH:MM:SS`, defaults to `01:00:00`).
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
 - `TD_LOG_DIR` – absolute base directory for this profile's logs; overrides the `TD_LOG_DIR` environment variable.
+- `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
+- `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
+
+## Monitoring with healthchecks.io
+
+Set `TD_HC_URL` to a check's ping URL (e.g. `https://hc-ping.com/<uuid>`). Each run pings `/start` before `rsync`, then pings `/<rsync exit status>` (`/0` is success) with the run summary as the body, or `/fail` if the next run could not be scheduled.
+
+Configure the check with a **period** equal to `TD_SUBMIT_INTERVAL` and a **grace time** a bit longer than `TD_SLURM_RUNTIME` plus typical queue wait. Healthchecks then also alerts when a run never starts or never finishes, which no in-job notification can report.
+
+### Compute nodes without internet or mail
+
+If compute nodes cannot reach the internet or relay mail (as on Princeton's Della), set `TD_RELAY_HOST` to a login node the job can ssh to without a password, typically the same host already used in `TD_DEST` (e.g. `della9`). Pings and report email are then run on that host via `ssh -o BatchMode=yes`. A failed ping or email is reported in the Slurm output but never fails the run or breaks the schedule.
 
 ## Test Mode
 
-Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacing `sbatch`, `squeue`, `scancel`, `rsync`, `mail`, and `sendmail` with test doubles. Use this when running unit tests or developing on a system without Slurm or a mail transfer agent.
+Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacing `sbatch`, `squeue`, `scancel`, `rsync`, `ssh`, `curl`, `mail`, and `sendmail` with test doubles. Use this when running unit tests or developing on a system without Slurm or a mail transfer agent.
 
 ## Logs
 
@@ -76,6 +88,7 @@ Below is a representative profile and command sequence for a project that mirror
 	TD_DRY_RUN=1
 	TD_SLURM_RUNTIME=02:00:00
 	TD_RSYNC_OPTS=--exclude .venv --delete
+	TD_HC_URL=https://hc-ping.com/your-check-uuid
 	```
 
 2. Export any optional runtime variables, then execute the scheduler:
