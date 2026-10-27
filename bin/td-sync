@@ -350,9 +350,11 @@ if [[ "$TD_DRY_RUN" == "1" ]]; then
 fi
 
 # Environments can have any name, so find them by their marker files and exclude
-# each root with a pattern anchored at the transfer root. Packages installed with
+# each root with a pattern anchored at the transfer root; a conda package cache
+# (urls.txt plus cache/) is treated the same way. Packages installed with
 # `pip install --target` have no environment root, so exclude exactly the
 # top-level paths their dist-info RECORD lists, leaving neighboring files alone.
+# site-packages belongs to an installed Python, so it is never scanned for these.
 # These rules precede TD_RSYNC_OPTS because rsync applies the first matching filter.
 if [[ "$TD_EXCLUDE_ENVS" == "1" ]]; then
   if [[ "$TD_SRC" =~ ^[^/]*: ]]; then
@@ -426,7 +428,10 @@ if [[ "$TD_EXCLUDE_ENVS" == "1" ]]; then
       pkg_name="$(basename "$rel")"
       printf 'Excluding pip-installed %s in %s (%s paths)\n' "${pkg_name%.dist-info}" "${parent%/}" "$pkg_paths" >>"$log_file"
       pkg_path_count=$((pkg_path_count + pkg_paths))
-    done < <(find "$src_root" -mindepth 1 -type d \( \( -exec test -e '{}/conda-meta' -o -e '{}/pyvenv.cfg' \; -printf 'env\t%P\0' -prune \) -o \( -name '*.dist-info' -printf 'pkg\t%P\0' -prune \) \) 2>>"$log_file")
+    done < <(find "$src_root" -mindepth 1 -type d \( \
+      \( \( -name site-packages -o -name dist-packages \) -prune \) -o \
+      \( -exec test -e '{}/conda-meta' -o -e '{}/pyvenv.cfg' -o -f '{}/urls.txt' -a -d '{}/cache' \; -printf 'env\t%P\0' -prune \) -o \
+      \( -name '*.dist-info' -printf 'pkg\t%P\0' -prune \) \) 2>>"$log_file")
     printf 'Excluded %s environment directories and %s pip-installed package paths\n\n' "$env_count" "$pkg_path_count" >>"$log_file"
     rsync_opts+=("--exclude-from=$exclude_file")
   fi

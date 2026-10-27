@@ -513,3 +513,18 @@ RECORD
   [ -n "$find_line" ]
   [ "$sbatch_line" -lt "$find_line" ]
 }
+
+@test "conda package caches are excluded whole and site-packages is not scanned for pip installs" {
+  root="$BATS_TEST_TMPDIR/cachesrc/proj"
+  mkdir -p "$root/.conda/pkgs/cache" "$root/.conda/pkgs/numpy-2.0/site-packages/numpy-2.0.dist-info" \
+    "$root/py/lib/python3.12/site-packages/six-1.0.dist-info" "$root/tgt/six-1.0.dist-info"
+  touch "$root/.conda/pkgs/urls.txt"
+  printf 'numpy/__init__.py,,\n' >"$root/.conda/pkgs/numpy-2.0/site-packages/numpy-2.0.dist-info/RECORD"
+  printf 'six.py,,\n' >"$root/py/lib/python3.12/site-packages/six-1.0.dist-info/RECORD"
+  printf 'six.py,,\n' >"$root/tgt/six-1.0.dist-info/RECORD"
+  submit_profile_fixture cache "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  run_job cache
+  [ "$status" -eq 0 ]
+  expected=$'/.conda/pkgs/\n/tgt/six.py'
+  [ "$(sort "$TD_MOCK_OUTPUT.exclude-from")" = "$expected" ]
+}
