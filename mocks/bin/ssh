@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Mimics ssh: skip -o options, take the host, and run the remaining words
+# through a shell exactly as the remote side would.
+while [[ "${1:-}" == "-o" ]]; do
+  shift 2
+done
+host="$1"
+shift
+remote="$*"
+
+if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
+  printf 'ssh %s %s\n' "$host" "$remote" >>"$TD_MOCK_OUTPUT"
+fi
+
+if [[ -n "${TD_MOCK_SSH_STATUS:-}" && "${TD_MOCK_SSH_STATUS}" != "0" ]]; then
+  echo "ssh: connect to host $host: mock failure" >&2
+  exit "$TD_MOCK_SSH_STATUS"
+fi
+
+exec bash -c "$remote"

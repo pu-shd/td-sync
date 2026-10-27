@@ -5,4 +5,16 @@ if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
   printf 'sbatch %s\n' "$*" >>"$TD_MOCK_OUTPUT"
 fi
 
+if [[ -n "${TD_MOCK_SBATCH_STATUS:-}" && "${TD_MOCK_SBATCH_STATUS}" != "0" ]]; then
+  echo "sbatch: error: mock submission failure" >&2
+  exit "$TD_MOCK_SBATCH_STATUS"
+fi
+
+for arg in "$@"; do
+  if [[ "$arg" == "--parsable" ]]; then
+    echo "${TD_MOCK_JOB_ID:-12345}"
+    exit 0
+  fi
+done
+
 echo "Submitted batch job ${TD_MOCK_JOB_ID:-12345}"

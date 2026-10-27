@@ -7,8 +7,10 @@ The script ingests `.env` configuration profiles and produces self-resubmitting 
 ## Features
 
 - Auto-discovers configuration profiles from `$HOME/.config/td-sync.d` or `$TD_CONFIG_DIR`.
-- Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=+TD_SUBMIT_INTERVAL`.
-- Creates and rotates log files under `$PWD/logs` or `$TD_LOG_DIR` with optional retention via `TD_LOG_RETENTION_DAYS`.
+- Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=now+TD_SUBMIT_INTERVAL`.
+- Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run.
+- Skips submitting a profile that already has a job queued, so re-running `td-sync` never creates duplicate schedules.
+- Writes logs to a dedicated `td-sync/` subdirectory of `$TD_LOG_DIR` (default `$PWD/logs`), with optional retention via `TD_LOG_RETENTION_DAYS`.
 - Provides mock `sbatch`, `mail`, and `sendmail` utilities for isolated testing via `TD_TEST_MODE`.
 - Ships a Docker test environment with `bats-core` for unit tests.
 
@@ -37,18 +39,36 @@ Each profile is a simple `.env` file. Required keys:
 
 Optional keys:
 
-- `TD_NOTIFY` – comma-separated email recipients.
+- `TD_NOTIFY` – comma-separated email recipients for the per-run report. The first recipient is also passed to Slurm (`--mail-type=FAIL,TIME_LIMIT_90`), so failures, timeouts, and approaching time limits are emailed by Slurm even when the job is killed before it can report.
 - `TD_DRY_RUN` – `1` or `true` for `rsync --dry-run`.
 - `TD_SLURM_RUNTIME` – job runtime (`HH:MM:SS`, defaults to `01:00:00`).
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
+- `TD_LOG_DIR` – absolute base directory for this profile's logs; overrides the `TD_LOG_DIR` environment variable.
+- `TD_NOTIFY_MIN_INTERVAL` – minimum seconds between report emails for a profile (default `3600`; `0` disables). Reports inside the window are skipped and noted in the Slurm output.
+- `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
+- `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
+
+## Monitoring with healthchecks.io
+
+Set `TD_HC_URL` to a check's ping URL (e.g. `https://hc-ping.com/<uuid>`). Each run pings `/start` before `rsync`, then pings `/<rsync exit status>` (`/0` is success) with the run summary as the body, or `/fail` if the next run could not be scheduled.
+
+Configure the check with a **period** equal to `TD_SUBMIT_INTERVAL` and a **grace time** a bit longer than `TD_SLURM_RUNTIME` plus typical queue wait. Healthchecks then also alerts when a run never starts or never finishes, which no in-job notification can report.
+
+### Compute nodes without internet or mail
+
+If compute nodes cannot reach the internet or relay mail (as on Princeton's Della), set `TD_RELAY_HOST` to a login node the job can ssh to without a password, typically the same host already used in `TD_DEST` (e.g. `della9`). Pings and report email are then run on that host via `ssh -o BatchMode=yes`. A failed ping or email is reported in the Slurm output but never fails the run or breaks the schedule.
 
 ## Test Mode
 
-Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacing `sbatch`, `mail`, and `sendmail` with test doubles. Use this when running unit tests or developing on a system without Slurm or a mail transfer agent.
+Setting `TD_TEST_MODE` to `1` or `true` prepends `mocks/bin` to `PATH`, replacing `sbatch`, `squeue`, `scancel`, `rsync`, `ssh`, `curl`, `mail`, and `sendmail` with test doubles. Use this when running unit tests or developing on a system without Slurm or a mail transfer agent.
 
-## Log Retention
+## Logs
 
-If `TD_LOG_RETENTION_DAYS` is set, Tiny Data Sync purges logs older than the configured number of days using `find -mtime` each time the script runs.
+Logs are always written to a `td-sync/` subdirectory of the log base directory (the profile's `TD_LOG_DIR`, else the `TD_LOG_DIR` environment variable, else `$PWD/logs`). Pointing `TD_LOG_DIR` at a shared directory such as `/scratch/gpfs/GROUP/logs` is therefore safe: other files there are never touched.
+
+Slurm's own output for each job goes to `<profile>_slurm-<jobid>.out` beside the rsync logs rather than to the submission directory.
+
+If `TD_LOG_RETENTION_DAYS` is set, Tiny Data Sync purges `*.log` and `*.out` files older than the configured number of days from that `td-sync/` subdirectory only, each time the script runs.
 
 ## Docker Image
 
@@ -69,6 +89,7 @@ Below is a representative profile and command sequence for a project that mirror
 	TD_DRY_RUN=1
 	TD_SLURM_RUNTIME=02:00:00
 	TD_RSYNC_OPTS=--exclude .venv --delete
+	TD_HC_URL=https://hc-ping.com/your-check-uuid
 	```
 
 2. Export any optional runtime variables, then execute the scheduler:

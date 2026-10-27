@@ -76,7 +76,7 @@ EOF
   [[ "$mock_log" == *"--time=02:30:00"* ]]
 }
 
-@test "log retention purges stale files" {
+@test "log retention purges stale td-sync logs only" {
   config_dir="$BATS_TEST_TMPDIR/config-retain"
   mkdir -p "$config_dir"
   cat >"$config_dir/keep.env" <<'EOF'
@@ -86,11 +86,273 @@ TD_SUBMIT_INTERVAL=7days
 EOF
   export TD_CONFIG_DIR="$config_dir"
   export TD_LOG_DIR="$BATS_TEST_TMPDIR/logs-retain"
-  mkdir -p "$TD_LOG_DIR"
-  old_log="$TD_LOG_DIR/old.log"
-  touch -d '3 days ago' "$old_log"
+  mkdir -p "$TD_LOG_DIR/td-sync"
+  old_log="$TD_LOG_DIR/td-sync/keep_20200101T000000.log"
+  old_out="$TD_LOG_DIR/td-sync/keep_slurm-1.out"
+  unrelated_log="$TD_LOG_DIR/someone-else.log"
+  touch -d '3 days ago' "$old_log" "$old_out" "$unrelated_log"
   export TD_LOG_RETENTION_DAYS=1
   run "$PROJECT_ROOT/bin/td-sync"
   [ "$status" -eq 0 ]
   [[ ! -e "$old_log" ]]
+  [[ ! -e "$old_out" ]]
+  [[ -e "$unrelated_log" ]]
+}
+
+@test "logs go to a td-sync subdirectory of TD_LOG_DIR from the environment" {
+  config_dir="$BATS_TEST_TMPDIR/config-envlog"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/envlog.env"
+  export TD_CONFIG_DIR="$config_dir"
+  export TD_LOG_DIR="$BATS_TEST_TMPDIR/shared-logs"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -eq 0 ]
+  [[ -d "$TD_LOG_DIR/td-sync" ]]
+  grep -qxF "TD_LOG_DIR=$TD_LOG_DIR/td-sync" "$PROJECT_ROOT/jobs/envlog.job.sh"
+}
+
+@test "TD_LOG_DIR set in a profile overrides the environment" {
+  config_dir="$BATS_TEST_TMPDIR/config-proflog"
+  profile_logs="$BATS_TEST_TMPDIR/profile-logs"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/proflog.env"
+  printf 'TD_LOG_DIR=%s\n' "$profile_logs" >>"$config_dir/proflog.env"
+  export TD_CONFIG_DIR="$config_dir"
+  export TD_LOG_DIR="$BATS_TEST_TMPDIR/env-logs"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -eq 0 ]
+  [[ -d "$profile_logs/td-sync" ]]
+  grep -qxF "TD_LOG_DIR=$profile_logs/td-sync" "$PROJECT_ROOT/jobs/proflog.job.sh"
+}
+
+@test "relative TD_LOG_DIR in a profile is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-rellog"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/rellog.env"
+  printf 'TD_LOG_DIR=relative/logs\n' >>"$config_dir/rellog.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_LOG_DIR must be an absolute path"* ]]
+}
+
+# Writes tests/tmp.env as profile $1 plus any extra lines, then runs td-sync.
+submit_profile_fixture() {
+  local name="$1"
+  shift
+  local config_dir="$BATS_TEST_TMPDIR/config-$name"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/$name.env"
+  local line
+  for line in "$@"; do
+    printf '%s\n' "$line" >>"$config_dir/$name.env"
+  done
+  export TD_CONFIG_DIR="$config_dir"
+  export TD_LOG_DIR="$BATS_TEST_TMPDIR/logs-$name"
+  "$PROJECT_ROOT/bin/td-sync"
+  rm -f "$TD_MOCK_OUTPUT"
+}
+
+run_job() {
+  run env PATH="$PROJECT_ROOT/mocks/bin:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/$1.job.sh"
+}
+
+@test "job schedules its next run before rsync, dependent on itself" {
+  submit_profile_fixture early
+  run_job early
+  [ "$status" -eq 0 ]
+  sbatch_line="$(grep -n '^sbatch ' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  rsync_line="$(grep -n '^rsync ' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  [ -n "$sbatch_line" ]
+  [ -n "$rsync_line" ]
+  [ "$sbatch_line" -lt "$rsync_line" ]
+  grep -q -- '--dependency=afterany:777' "$TD_MOCK_OUTPUT"
+  grep -q -- '--begin=now+30' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+}
+
+@test "next run survives when the job is killed mid-rsync" {
+  submit_profile_fixture killed
+  export TD_MOCK_RSYNC_KILL_PARENT=1
+  run_job killed
+  [ "$status" -ne 0 ]
+  grep -q '^sbatch .*--dependency=afterany:777' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+}
+
+@test "rsync failure cancels the already scheduled next run" {
+  submit_profile_fixture failing
+  export TD_MOCK_RSYNC_STATUS=11 TD_MOCK_JOB_ID=4242
+  run_job failing
+  [ "$status" -eq 11 ]
+  grep -qx 'scancel 4242' "$TD_MOCK_OUTPUT"
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/failing_*.log | head -1)"
+  grep -q 'rsync exited with status 11' "$latest_log"
+}
+
+@test "failed requeue submission is logged and rsync still runs" {
+  submit_profile_fixture noqueue
+  export TD_MOCK_SBATCH_STATUS=1
+  run_job noqueue
+  [ "$status" -eq 0 ]
+  grep -q '^rsync ' "$TD_MOCK_OUTPUT"
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/noqueue_*.log | head -1)"
+  grep -q 'Unable to requeue job' "$latest_log"
+}
+
+@test "td-sync refreshes the job script but does not resubmit an already queued profile" {
+  submit_profile_fixture queued
+  rm -f "$PROJECT_ROOT/jobs/queued.job.sh"
+  export TD_MOCK_SQUEUE_OUTPUT=$'555\n556'
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already queued"* ]]
+  [[ -f "$PROJECT_ROOT/jobs/queued.job.sh" ]]
+  grep -q '^squeue .*-n td-sync-queued' "$TD_MOCK_OUTPUT"
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
+}
+
+@test "td-sync does not submit when squeue fails" {
+  submit_profile_fixture sqfail
+  export TD_MOCK_SQUEUE_STATUS=1
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unable to query squeue"* ]]
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
+}
+
+@test "Slurm emails the first recipient on failure and writes output next to the logs" {
+  config_dir="$BATS_TEST_TMPDIR/config-slurmmail"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/slurmmail.env"
+  printf 'TD_NOTIFY="a@example.org, b@example.org"\n' >>"$config_dir/slurmmail.env"
+  export TD_CONFIG_DIR="$config_dir"
+  export TD_LOG_DIR="$BATS_TEST_TMPDIR/logs-slurmmail"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -eq 0 ]
+  grep -qF -- "--mail-type=FAIL,TIME_LIMIT_90 --mail-user=a@example.org" "$TD_MOCK_OUTPUT"
+  grep -qF -- "--output=$TD_LOG_DIR/td-sync/slurmmail_slurm-%j.out" "$TD_MOCK_OUTPUT"
+  rm -f "$TD_MOCK_OUTPUT"
+  run_job slurmmail
+  [ "$status" -eq 0 ]
+  grep -q '^sbatch --parsable .*--mail-type=FAIL,TIME_LIMIT_90 --mail-user=a@example.org' "$TD_MOCK_OUTPUT"
+  grep -qF -- "--output=$TD_LOG_DIR/td-sync/slurmmail_slurm-%j.out" "$TD_MOCK_OUTPUT"
+}
+
+@test "no Slurm mail options without TD_NOTIFY" {
+  submit_profile_fixture nomail
+  run "$PROJECT_ROOT/bin/td-sync"
+  ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT"
+  grep -q -- '--output=' "$TD_MOCK_OUTPUT"
+}
+
+@test "healthchecks gets a start ping and an exit-status ping with the summary" {
+  submit_profile_fixture hc "TD_HC_URL=https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/"
+  run_job hc
+  [ "$status" -eq 0 ]
+  start_line="$(grep -n 'curl .*\[https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/start\]' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  rsync_line="$(grep -n '^rsync ' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  [ -n "$start_line" ]
+  [ "$start_line" -lt "$rsync_line" ]
+  grep -q 'curl .*\[https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/0\]' "$TD_MOCK_OUTPUT"
+  grep -q 'Rsync exit status: 0' "$TD_MOCK_OUTPUT.curl-body"
+}
+
+@test "healthchecks receives the rsync exit status on failure" {
+  submit_profile_fixture hcfail "TD_HC_URL=https://hc-ping.com/abc"
+  export TD_MOCK_RSYNC_STATUS=23
+  run_job hcfail
+  [ "$status" -eq 23 ]
+  grep -q 'curl .*\[https://hc-ping.com/abc/23\]' "$TD_MOCK_OUTPUT"
+}
+
+@test "healthchecks is told to fail when the next run cannot be scheduled" {
+  submit_profile_fixture hcnoqueue "TD_HC_URL=https://hc-ping.com/abc"
+  export TD_MOCK_SBATCH_STATUS=1
+  run_job hcnoqueue
+  grep -q 'curl .*\[https://hc-ping.com/abc/fail\]' "$TD_MOCK_OUTPUT"
+}
+
+@test "pings and mail go through TD_RELAY_HOST with arguments intact" {
+  submit_profile_fixture relay "TD_HC_URL=https://hc-ping.com/abc" "TD_RELAY_HOST=della9" "TD_NOTIFY=ops@example.org"
+  run_job relay
+  [ "$status" -eq 0 ]
+  grep -q '^ssh della9 .*curl .*hc-ping.com/abc/start' "$TD_MOCK_OUTPUT"
+  grep -q '^ssh della9 .*curl .*hc-ping.com/abc/0' "$TD_MOCK_OUTPUT"
+  grep -q '^ssh della9 .*mail' "$TD_MOCK_OUTPUT"
+  grep -qxF 'mail [-s] [Tiny Data Sync results for td-sync-relay] [ops@example.org]' "$TD_MOCK_OUTPUT"
+  grep -q 'Rsync exit status: 0' "$TD_MOCK_OUTPUT.curl-body"
+}
+
+@test "unreachable relay, ping, or mailer never fails the job or the schedule" {
+  submit_profile_fixture flaky "TD_HC_URL=https://hc-ping.com/abc" "TD_RELAY_HOST=della9" "TD_NOTIFY=ops@example.org"
+  export TD_MOCK_SSH_STATUS=255
+  run_job flaky
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"healthchecks ping /start failed"* ]]
+  [[ "$output" == *"unable to email report to ops@example.org"* ]]
+  grep -q '^sbatch --parsable' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+}
+
+@test "unsafe TD_HC_URL is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badhc"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badhc.env"
+  printf 'TD_HC_URL='"'"'https://hc-ping.com/x;touch /tmp/pwned'"'"'\n' >>"$config_dir/badhc.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_HC_URL must be an https:// URL"* ]]
+}
+
+@test "unsafe TD_RELAY_HOST is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badrelay"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badrelay.env"
+  printf 'TD_RELAY_HOST=-oProxyCommand=evil\n' >>"$config_dir/badrelay.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_RELAY_HOST must be a plain host name"* ]]
+}
+
+@test "report email is throttled per profile" {
+  submit_profile_fixture throttle "TD_NOTIFY=a@example.org,b@example.org"
+  run_job throttle
+  [ "$status" -eq 0 ]
+  run_job throttle
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"report email suppressed"* ]]
+  [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
+}
+
+@test "TD_NOTIFY_MIN_INTERVAL=0 disables email throttling" {
+  submit_profile_fixture nothrottle "TD_NOTIFY=a@example.org" "TD_NOTIFY_MIN_INTERVAL=0"
+  run_job nothrottle
+  run_job nothrottle
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
+}
+
+@test "failed email does not start the throttle window" {
+  submit_profile_fixture mailfail "TD_NOTIFY=a@example.org"
+  export TD_MOCK_MAIL_STATUS=1
+  run_job mailfail
+  [ "$status" -eq 0 ]
+  unset TD_MOCK_MAIL_STATUS
+  run_job mailfail
+  [[ "$output" != *"suppressed"* ]]
+  [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
+}
+
+@test "non-numeric TD_NOTIFY_MIN_INTERVAL is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badthrottle"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badthrottle.env"
+  printf 'TD_NOTIFY_MIN_INTERVAL=1h\n' >>"$config_dir/badthrottle.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_NOTIFY_MIN_INTERVAL must be a whole number of seconds"* ]]
 }

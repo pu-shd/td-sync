@@ -12,7 +12,8 @@ Usage: td-sync [--help]
 Environment variables:
   TD_TEST_MODE            When set to 1 or true, use bundled mock commands for sbatch and mailer utilities.
   TD_CONFIG_DIR           Directory containing *.env configuration profiles (default: $HOME/.config/td-sync.d).
-  TD_LOG_DIR              Directory to store log files (default: $PWD/logs).
+  TD_LOG_DIR              Base directory for logs (default: $PWD/logs). Logs are written to a
+                          td-sync/ subdirectory so a shared logs directory is never cluttered or purged.
   TD_LOG_RETENTION_DAYS   Number of days to retain log files before deletion.
   TD_HOME                 Overrides auto-detected project root; required only if script cannot determine its location.
 
@@ -26,6 +27,11 @@ Optional profile settings:
   TD_NOTIFY               Comma-separated recipient emails for notifications.
   TD_DRY_RUN              When 1/true, perform rsync dry-run.
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
+  TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
+  TD_NOTIFY_MIN_INTERVAL  Minimum seconds between report emails per profile (default: 3600; 0 disables).
+  TD_HC_URL               healthchecks.io ping URL; pinged at start and with the exit status at the end.
+  TD_RELAY_HOST           Host to send pings and report email through via ssh, for compute nodes
+                          without internet or working mail (e.g. della9).
 
 The script inspects all *.env profiles within TD_CONFIG_DIR, ensures each meets the minimum
 requirements, generates a Slurm batch script per profile, and submits it. Submitted jobs
@@ -130,13 +136,14 @@ purge_old_logs() {
     return
   fi
 
-  find "$dir" -type f -name '*.log' -mtime "+$retention" -delete 2>/dev/null || true
+  find "$dir" -maxdepth 1 -type f \( -name '*.log' -o -name '*.out' \) -mtime "+$retention" -delete 2>/dev/null || true
 }
 
 load_profile() {
   local profile_path="$1"
 
-  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS
+  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL
+  TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
   source "$profile_path"
@@ -167,6 +174,32 @@ validate_profile() {
     TD_SLURM_RUNTIME="01:00:00"
   fi
 
+  if [[ -z "${TD_LOG_DIR:-}" || "$TD_LOG_DIR" != /* ]]; then
+    log_error "[$profile_name] TD_LOG_DIR must be an absolute path"
+    return 1
+  fi
+
+  TD_NOTIFY_MIN_INTERVAL="${TD_NOTIFY_MIN_INTERVAL:-3600}"
+  if ! [[ "$TD_NOTIFY_MIN_INTERVAL" =~ ^[0-9]+$ ]]; then
+    log_error "[$profile_name] TD_NOTIFY_MIN_INTERVAL must be a whole number of seconds"
+    return 1
+  fi
+
+  if [[ -n "${TD_HC_URL:-}" ]]; then
+    TD_HC_URL="${TD_HC_URL%/}"
+    if ! [[ "$TD_HC_URL" =~ ^https://[A-Za-z0-9._~/-]+$ ]]; then
+      log_error "[$profile_name] TD_HC_URL must be an https:// URL containing only letters, digits, and ._~/-"
+      return 1
+    fi
+  fi
+
+  if [[ -n "${TD_RELAY_HOST:-}" ]]; then
+    if ! [[ "$TD_RELAY_HOST" =~ ^[A-Za-z0-9_][A-Za-z0-9._@-]*$ ]]; then
+      log_error "[$profile_name] TD_RELAY_HOST must be a plain host name (optionally user@host)"
+      return 1
+    fi
+  fi
+
   if [[ -n "${TD_NOTIFY:-}" ]]; then
     if [[ -z "$MAILER_CMD" ]]; then
       log_warn "[$profile_name] TD_NOTIFY set but no mailer available; notifications disabled"
@@ -189,6 +222,8 @@ write_job_script() {
   local job_script_path="$3"
   local log_dir="$4"
   local mailer_cmd="$5"
+  shift 5
+  local sbatch_args=("$@")
 
   local dry_flag="0"
   if is_truthy "${TD_DRY_RUN:-}"; then
@@ -199,27 +234,27 @@ write_job_script() {
   local td_src_escaped
   local td_dest_escaped
   local td_notify_escaped
-  local td_runtime_escaped
-  local td_account_escaped
   local td_interval_escaped
   local log_dir_escaped
   local log_base_escaped
   local job_name_escaped
   local self_path_escaped
   local td_rsync_opts_escaped
+  local td_hc_url_escaped
+  local td_relay_host_escaped
 
   printf -v mailer_escaped '%q' "$mailer_cmd"
   printf -v td_src_escaped '%q' "${TD_SRC:-}"
   printf -v td_dest_escaped '%q' "${TD_DEST:-}"
   printf -v td_notify_escaped '%q' "${TD_NOTIFY:-}"
-  printf -v td_runtime_escaped '%q' "${TD_SLURM_RUNTIME:-}"
-  printf -v td_account_escaped '%q' "${TD_SLURM_ACCOUNT:-}"
   printf -v td_interval_escaped '%q' "${TD_SUBMIT_INTERVAL:-}"
   printf -v log_dir_escaped '%q' "$log_dir"
   printf -v log_base_escaped '%q' "$profile_label"
   printf -v job_name_escaped '%q' "td-sync-$sanitized_name"
   printf -v self_path_escaped '%q' "$job_script_path"
   printf -v td_rsync_opts_escaped '%q' "${TD_RSYNC_OPTS:-}"
+  printf -v td_hc_url_escaped '%q' "${TD_HC_URL:-}"
+  printf -v td_relay_host_escaped '%q' "${TD_RELAY_HOST:-}"
 
   {
     printf '#!/usr/bin/env bash\n'
@@ -228,15 +263,20 @@ write_job_script() {
     printf 'TD_DEST=%s\n' "$td_dest_escaped"
     printf 'TD_NOTIFY=%s\n' "$td_notify_escaped"
     printf 'TD_DRY_RUN=%s\n' "$dry_flag"
-    printf 'TD_SLURM_RUNTIME=%s\n' "$td_runtime_escaped"
-    printf 'TD_SLURM_ACCOUNT=%s\n' "$td_account_escaped"
     printf 'TD_SUBMIT_INTERVAL=%s\n' "$td_interval_escaped"
     printf 'TD_LOG_DIR=%s\n' "$log_dir_escaped"
   printf 'LOG_BASENAME=%s\n' "$log_base_escaped"
     printf 'MAILER_CMD=%s\n' "$mailer_escaped"
     printf 'JOB_NAME=%s\n' "$job_name_escaped"
     printf 'SELF_PATH=%s\n' "$self_path_escaped"
-    printf 'TD_RSYNC_OPTS=%s\n\n' "$td_rsync_opts_escaped"
+    printf 'TD_RSYNC_OPTS=%s\n' "$td_rsync_opts_escaped"
+    printf 'TD_NOTIFY_MIN_INTERVAL=%s\n' "$TD_NOTIFY_MIN_INTERVAL"
+    printf 'TD_HC_URL=%s\n' "$td_hc_url_escaped"
+    printf 'TD_RELAY_HOST=%s\n' "$td_relay_host_escaped"
+    printf '# shellcheck disable=SC2054\n'
+    printf 'SBATCH_ARGS=('
+    printf '%q ' "${sbatch_args[@]}"
+    printf ')\n\n'
     cat <<'EOF'
 mkdir -p "${TD_LOG_DIR}"
 
@@ -244,6 +284,28 @@ timestamp="$(date +"%Y%m%dT%H%M%S")"
 log_file="${TD_LOG_DIR}/${LOG_BASENAME}_${timestamp}.log"
 summary_file="$(mktemp)"
 trap 'rm -f "$summary_file"' EXIT
+
+# Compute nodes may have no internet or working mail; when TD_RELAY_HOST is set,
+# run outbound commands there over ssh, the same way rsync reaches a remote host.
+run_outbound() {
+  if [[ -n "$TD_RELAY_HOST" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+      "$TD_RELAY_HOST" "$(printf '%q ' "$@")"
+  else
+    "$@"
+  fi
+}
+
+# Reads the ping body from stdin. A failed ping is reported but never fatal.
+hc_ping() {
+  local suffix="$1"
+  [[ -n "$TD_HC_URL" ]] || return 0
+  if ! run_outbound curl -fsS -m 30 --retry 3 -o /dev/null --data-binary @- "${TD_HC_URL}${suffix}"; then
+    printf 'Warning: healthchecks ping %s failed\n' "$suffix" >&2
+  fi
+}
+
+hc_ping /start </dev/null
 
 rsync_opts=("-av")
 if [[ "$TD_DRY_RUN" == "1" ]]; then
@@ -257,38 +319,50 @@ if [[ -n "$TD_RSYNC_OPTS" ]]; then
 fi
 rsync_opts+=("$TD_SRC" "$TD_DEST")
 
-set +e
 {
   printf 'Tiny Data Sync job: %s\n' "$JOB_NAME"
   printf 'Started: %s\n' "$timestamp"
   printf 'Source: %s\n' "$TD_SRC"
   printf 'Destination: %s\n' "$TD_DEST"
   printf 'Dry run: %s\n\n' "$TD_DRY_RUN"
-  rsync "${rsync_opts[@]}"
-} &>"$log_file"
+} >"$log_file"
+
+# Schedule the next run before rsync starts, so a time limit, node failure, or
+# preemption that kills this job cannot break the chain. afterany keeps it from
+# starting while this run is still going.
+next_job_id=""
+requeue_note="Requeue interval not set"
+if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
+  dependency_args=()
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    dependency_args=("--dependency=afterany:${SLURM_JOB_ID}")
+  fi
+  if next_job_id="$(sbatch --parsable "${SBATCH_ARGS[@]}" ${dependency_args[@]+"${dependency_args[@]}"} --begin="now+${TD_SUBMIT_INTERVAL}" "$SELF_PATH")"; then
+    next_job_id="${next_job_id%%;*}"
+    requeue_note="Next run scheduled after $TD_SUBMIT_INTERVAL (job $next_job_id)"
+  else
+    next_job_id=""
+    printf 'Unable to requeue job with interval %s\n' "$TD_SUBMIT_INTERVAL" >>"$log_file"
+    requeue_note="Failed to schedule next run; check logs"
+  fi
+fi
+
+set +e
+rsync "${rsync_opts[@]}" &>>"$log_file"
 rsync_status=$?
 set -e
 
-requeue_note="Requeue not requested"
-
 if [[ $rsync_status -ne 0 ]]; then
   printf 'rsync exited with status %s\n' "$rsync_status" >>"$log_file"
-  requeue_note="Job not requeued; rsync exited with status $rsync_status"
-fi
-
-if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
-  if [[ $rsync_status -eq 0 ]]; then
-    if sbatch --job-name="$JOB_NAME" --time="$TD_SLURM_RUNTIME" --account="$TD_SLURM_ACCOUNT" --begin="now+${TD_SUBMIT_INTERVAL}" "$SELF_PATH"; then
-      requeue_note="Next run scheduled after $TD_SUBMIT_INTERVAL"
+  if [[ -n "$next_job_id" ]]; then
+    if scancel "$next_job_id"; then
+      requeue_note="Next run (job $next_job_id) cancelled; rsync exited with status $rsync_status"
     else
-      printf 'Unable to requeue job with interval %s\n' "$TD_SUBMIT_INTERVAL" >>"$log_file"
-      requeue_note="Failed to schedule next run; check logs"
+      requeue_note="rsync exited with status $rsync_status but cancelling next run (job $next_job_id) failed"
     fi
   else
     requeue_note="Job not requeued; rsync exited with status $rsync_status"
   fi
-else
-  requeue_note="Requeue interval not set"
 fi
 
 {
@@ -305,21 +379,58 @@ fi
   tail -n 200 "$log_file"
 } >"$summary_file"
 
+if [[ $rsync_status -ne 0 ]]; then
+  hc_suffix="/$rsync_status"
+elif [[ -n "$TD_SUBMIT_INTERVAL" && -z "$next_job_id" ]]; then
+  hc_suffix="/fail"
+else
+  hc_suffix="/0"
+fi
+hc_ping "$hc_suffix" < <(head -c 100000 "$summary_file")
+
+send_report() {
+  local recipient="$1"
+  if [[ "$MAILER_CMD" == *sendmail ]]; then
+    {
+      printf 'To: %s\n' "$recipient"
+      printf 'Subject: Tiny Data Sync results for %s\n\n' "$JOB_NAME"
+      cat "$summary_file"
+    } | run_outbound "$MAILER_CMD" "$recipient"
+  else
+    run_outbound "$MAILER_CMD" -s "Tiny Data Sync results for $JOB_NAME" "$recipient" <"$summary_file"
+  fi
+}
+
+# Throttle report email per profile; the stamp holds the epoch of the last sent report.
+email_stamp="${TD_LOG_DIR}/.${LOG_BASENAME}.last-email"
+email_throttled() {
+  local last now
+  [[ -f "$email_stamp" ]] || return 1
+  last="$(cat "$email_stamp" 2>/dev/null || true)"
+  [[ "$last" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( now - last < TD_NOTIFY_MIN_INTERVAL ))
+}
+
 if [[ -n "$TD_NOTIFY" && -n "$MAILER_CMD" ]]; then
-  IFS=',' read -r -a recipients <<<"$TD_NOTIFY"
-  for recipient in "${recipients[@]}"; do
-    recipient="$(printf '%s' "$recipient" | xargs)"
-    [[ -z "$recipient" ]] && continue
-    if [[ "$MAILER_CMD" == *sendmail ]]; then
-      {
-        printf 'To: %s\n' "$recipient"
-        printf 'Subject: Tiny Data Sync results for %s\n\n' "$JOB_NAME"
-        cat "$summary_file"
-      } | "$MAILER_CMD" "$recipient"
-    else
-      "$MAILER_CMD" -s "Tiny Data Sync results for $JOB_NAME" "$recipient" <"$summary_file"
+  if email_throttled; then
+    printf 'Notice: report email suppressed; last one was sent less than %s seconds ago\n' "$TD_NOTIFY_MIN_INTERVAL" >&2
+  else
+    email_sent=0
+    IFS=',' read -r -a recipients <<<"$TD_NOTIFY"
+    for recipient in "${recipients[@]}"; do
+      recipient="$(printf '%s' "$recipient" | xargs)"
+      [[ -z "$recipient" ]] && continue
+      if send_report "$recipient"; then
+        email_sent=1
+      else
+        printf 'Warning: unable to email report to %s\n' "$recipient" >&2
+      fi
+    done
+    if (( email_sent )); then
+      date +%s >"$email_stamp" || printf 'Warning: unable to record email time in %s\n' "$email_stamp" >&2
     fi
-  done
+  fi
 fi
 
 if [[ $rsync_status -ne 0 ]]; then
@@ -334,7 +445,6 @@ EOF
 submit_profile() {
   local profile_path="$1"
   local config_dir="$2"
-  local log_dir="$3"
 
   local profile_filename
   profile_filename="$(basename "$profile_path")"
@@ -343,16 +453,45 @@ submit_profile() {
   load_profile "$profile_path"
   validate_profile "$profile_name" || return 1
 
+  local log_dir="$TD_LOG_DIR/td-sync"
+  if [[ ! -d "$log_dir" ]]; then
+    mkdir -p "$log_dir"
+    log_info "Created log directory at $log_dir"
+  fi
+  purge_old_logs "$log_dir"
+
   local sanitized
   sanitized="$(sanitize_name "$profile_name")"
   local jobs_dir="$TD_HOME/jobs"
   mkdir -p "$jobs_dir"
   local job_script_path="$jobs_dir/$sanitized.job.sh"
 
-  write_job_script "$profile_name" "$sanitized" "$job_script_path" "$log_dir" "$MAILER_CMD"
-
+  local job_name="td-sync-$sanitized"
   local sbatch_args
-  sbatch_args=("--job-name=td-sync-$sanitized" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT")
+  sbatch_args=("--job-name=$job_name" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT" "--output=$log_dir/${sanitized}_slurm-%j.out")
+
+  # Slurm sends this mail itself, so it still arrives when a job is killed before
+  # the job script can report. --mail-user takes a single address.
+  if [[ -n "${TD_NOTIFY:-}" ]]; then
+    local first_recipient="${TD_NOTIFY%%,*}"
+    first_recipient="$(printf '%s' "$first_recipient" | xargs)"
+    if [[ -n "$first_recipient" ]]; then
+      sbatch_args+=("--mail-type=FAIL,TIME_LIMIT_90" "--mail-user=$first_recipient")
+    fi
+  fi
+
+  write_job_script "$profile_name" "$sanitized" "$job_script_path" "$log_dir" "$MAILER_CMD" "${sbatch_args[@]}"
+
+  # Each run keeps its successor queued, so a queued job means the chain is alive.
+  local queued
+  if ! queued="$(squeue -h -u "${USER:-$(id -un)}" -n "$job_name" -o %i)"; then
+    log_error "[$profile_name] unable to query squeue; not submitting"
+    return 1
+  fi
+  if [[ -n "$queued" ]]; then
+    log_info "Profile $profile_name already queued (job ${queued//$'\n'/, }); refreshed $job_script_path for future runs. Use scancel first to restart it now."
+    return 0
+  fi
 
   log_info "Submitting profile $profile_name via $job_script_path"
   sbatch "${sbatch_args[@]}" "$job_script_path"
@@ -377,6 +516,10 @@ main() {
     else
       fatal "sbatch not found in PATH. Install Slurm or run in TD_TEST_MODE for testing."
     fi
+  fi
+
+  if ! require_command squeue; then
+    fatal "squeue not found in PATH. Install Slurm or run in TD_TEST_MODE for testing."
   fi
 
   if ! require_command rsync; then
@@ -412,23 +555,15 @@ main() {
     fi
   fi
 
-  local log_dir
   if [[ -n ${TD_LOG_DIR+x} ]]; then
-    log_dir="$TD_LOG_DIR"
+    LOG_BASE_DEFAULT="$TD_LOG_DIR"
   else
-    log_dir="$PWD/logs"
+    LOG_BASE_DEFAULT="$PWD/logs"
   fi
 
-  if [[ -z "$log_dir" ]]; then
+  if [[ -z "$LOG_BASE_DEFAULT" ]]; then
     fatal "TD_LOG_DIR cannot be empty"
   fi
-
-  if [[ ! -d "$log_dir" ]]; then
-    mkdir -p "$log_dir"
-    log_info "Created log directory at $log_dir"
-  fi
-
-  purge_old_logs "$log_dir"
 
   shopt -s nullglob
   local profiles=("$config_dir"/*.env)
@@ -442,7 +577,7 @@ main() {
   local status=0
   local profile
   for profile in "${profiles[@]}"; do
-    if ! submit_profile "$profile" "$config_dir" "$log_dir"; then
+    if ! submit_profile "$profile" "$config_dir"; then
       status=1
     fi
   done

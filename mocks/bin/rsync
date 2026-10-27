@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
+  printf 'rsync %s\n' "$*" >>"$TD_MOCK_OUTPUT"
+fi
+
+echo "mock rsync transfer"
+
+# Simulate Slurm killing the batch script at its time limit.
+if [[ "${TD_MOCK_RSYNC_KILL_PARENT:-}" == "1" ]]; then
+  kill -TERM "$PPID"
+  exit 143
+fi
+
+exit "${TD_MOCK_RSYNC_STATUS:-0}"

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${TD_MOCK_OUTPUT:-}" ]]; then
+  printf 'squeue %s\n' "$*" >>"$TD_MOCK_OUTPUT"
+fi
+
+if [[ -n "${TD_MOCK_SQUEUE_STATUS:-}" && "${TD_MOCK_SQUEUE_STATUS}" != "0" ]]; then
+  echo "squeue: error: mock failure" >&2
+  exit "$TD_MOCK_SQUEUE_STATUS"
+fi
+
+if [[ -n "${TD_MOCK_SQUEUE_OUTPUT:-}" ]]; then
+  printf '%s\n' "$TD_MOCK_SQUEUE_OUTPUT"
+fi
