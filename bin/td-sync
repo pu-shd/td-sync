@@ -12,7 +12,8 @@ Usage: td-sync [--help]
 Environment variables:
   TD_TEST_MODE            When set to 1 or true, use bundled mock commands for sbatch and mailer utilities.
   TD_CONFIG_DIR           Directory containing *.env configuration profiles (default: $HOME/.config/td-sync.d).
-  TD_LOG_DIR              Directory to store log files (default: $PWD/logs).
+  TD_LOG_DIR              Base directory for logs (default: $PWD/logs). Logs are written to a
+                          td-sync/ subdirectory so a shared logs directory is never cluttered or purged.
   TD_LOG_RETENTION_DAYS   Number of days to retain log files before deletion.
   TD_HOME                 Overrides auto-detected project root; required only if script cannot determine its location.
 
@@ -26,6 +27,7 @@ Optional profile settings:
   TD_NOTIFY               Comma-separated recipient emails for notifications.
   TD_DRY_RUN              When 1/true, perform rsync dry-run.
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
+  TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
 
 The script inspects all *.env profiles within TD_CONFIG_DIR, ensures each meets the minimum
 requirements, generates a Slurm batch script per profile, and submits it. Submitted jobs
@@ -130,13 +132,14 @@ purge_old_logs() {
     return
   fi
 
-  find "$dir" -type f -name '*.log' -mtime "+$retention" -delete 2>/dev/null || true
+  find "$dir" -maxdepth 1 -type f \( -name '*.log' -o -name '*.out' \) -mtime "+$retention" -delete 2>/dev/null || true
 }
 
 load_profile() {
   local profile_path="$1"
 
   unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS
+  TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
   source "$profile_path"
@@ -165,6 +168,11 @@ validate_profile() {
     fi
   else
     TD_SLURM_RUNTIME="01:00:00"
+  fi
+
+  if [[ -z "${TD_LOG_DIR:-}" || "$TD_LOG_DIR" != /* ]]; then
+    log_error "[$profile_name] TD_LOG_DIR must be an absolute path"
+    return 1
   fi
 
   if [[ -n "${TD_NOTIFY:-}" ]]; then
@@ -334,7 +342,6 @@ EOF
 submit_profile() {
   local profile_path="$1"
   local config_dir="$2"
-  local log_dir="$3"
 
   local profile_filename
   profile_filename="$(basename "$profile_path")"
@@ -342,6 +349,13 @@ submit_profile() {
 
   load_profile "$profile_path"
   validate_profile "$profile_name" || return 1
+
+  local log_dir="$TD_LOG_DIR/td-sync"
+  if [[ ! -d "$log_dir" ]]; then
+    mkdir -p "$log_dir"
+    log_info "Created log directory at $log_dir"
+  fi
+  purge_old_logs "$log_dir"
 
   local sanitized
   sanitized="$(sanitize_name "$profile_name")"
@@ -412,23 +426,15 @@ main() {
     fi
   fi
 
-  local log_dir
   if [[ -n ${TD_LOG_DIR+x} ]]; then
-    log_dir="$TD_LOG_DIR"
+    LOG_BASE_DEFAULT="$TD_LOG_DIR"
   else
-    log_dir="$PWD/logs"
+    LOG_BASE_DEFAULT="$PWD/logs"
   fi
 
-  if [[ -z "$log_dir" ]]; then
+  if [[ -z "$LOG_BASE_DEFAULT" ]]; then
     fatal "TD_LOG_DIR cannot be empty"
   fi
-
-  if [[ ! -d "$log_dir" ]]; then
-    mkdir -p "$log_dir"
-    log_info "Created log directory at $log_dir"
-  fi
-
-  purge_old_logs "$log_dir"
 
   shopt -s nullglob
   local profiles=("$config_dir"/*.env)
@@ -442,7 +448,7 @@ main() {
   local status=0
   local profile
   for profile in "${profiles[@]}"; do
-    if ! submit_profile "$profile" "$config_dir" "$log_dir"; then
+    if ! submit_profile "$profile" "$config_dir"; then
       status=1
     fi
   done
