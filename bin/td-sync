@@ -452,7 +452,10 @@ set -e
 
 if [[ $rsync_status -ne 0 ]]; then
   printf 'rsync exited with status %s\n' "$rsync_status" >>"$log_file"
-  if [[ -n "$next_job_id" ]]; then
+  if [[ -n "$next_job_id" ]] && (( rsync_status == 23 || rsync_status == 24 )); then
+    # Partial transfer: everything readable was copied, so keep the schedule alive.
+    requeue_note="Next run (job $next_job_id) kept; rsync exited with status $rsync_status (partial transfer, see log)"
+  elif [[ -n "$next_job_id" ]]; then
     if scancel "$next_job_id"; then
       requeue_note="Next run (job $next_job_id) cancelled; rsync exited with status $rsync_status"
     else
@@ -461,6 +464,7 @@ if [[ $rsync_status -ne 0 ]]; then
   else
     requeue_note="Job not requeued; rsync exited with status $rsync_status"
   fi
+  printf '%s\n' "$requeue_note" >>"$log_file"
 fi
 
 {

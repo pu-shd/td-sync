@@ -258,6 +258,21 @@ run_job() {
   grep -q 'Rsync exit status: 0' "$TD_MOCK_OUTPUT.curl-body"
 }
 
+@test "partial transfer (rsync 23/24) reports failure but keeps the next run" {
+  local code
+  for code in 23 24; do
+    submit_profile_fixture "partial$code"
+    export TD_MOCK_RSYNC_STATUS=$code TD_MOCK_JOB_ID=4242
+    run_job "partial$code"
+    [ "$status" -eq "$code" ]
+    ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
+    latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/partial${code}_*.log | head -1)"
+    grep -q "rsync exited with status $code" "$latest_log"
+    grep -q "Next run (job 4242) kept" "$latest_log"
+    rm -f "$TD_MOCK_OUTPUT"
+  done
+}
+
 @test "healthchecks receives the rsync exit status on failure" {
   submit_profile_fixture hcfail "TD_HC_URL=https://hc-ping.com/abc"
   export TD_MOCK_RSYNC_STATUS=23

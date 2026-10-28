@@ -8,7 +8,7 @@ The script ingests `.env` configuration profiles and produces self-resubmitting 
 
 - Auto-discovers configuration profiles from `$HOME/.config/td-sync.d` or `$TD_CONFIG_DIR`.
 - Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=now+TD_SUBMIT_INTERVAL`.
-- Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run.
+- Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run; a partial transfer (exit 23 or 24, e.g. unreadable or vanished files) is reported as a failure but keeps the schedule.
 - Skips submitting a profile that already has a job queued, so re-running `td-sync` never creates duplicate schedules.
 - Writes logs to a dedicated `td-sync/` subdirectory of `$TD_LOG_DIR` (default `$PWD/logs`), with optional retention via `TD_LOG_RETENTION_DAYS`.
 - Provides mock `sbatch`, `mail`, and `sendmail` utilities for isolated testing via `TD_TEST_MODE`.
