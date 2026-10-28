@@ -42,6 +42,7 @@ Optional keys:
 - `TD_NOTIFY` – comma-separated email recipients for the per-run report. The first recipient is also passed to Slurm (`--mail-type=FAIL,TIME_LIMIT_90`), so failures, timeouts, and approaching time limits are emailed by Slurm even when the job is killed before it can report.
 - `TD_DRY_RUN` – `1` or `true` for `rsync --dry-run`.
 - `TD_SLURM_RUNTIME` – job runtime (`HH:MM:SS`, defaults to `01:00:00`).
+- `TD_SLURM_MEM` – memory per job as a Slurm size (`512M`, `1G`; defaults to `1G`). rsync needs little memory, and over-asking counts against cluster efficiency.
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
 - `TD_LOG_DIR` – absolute base directory for this profile's logs; overrides the `TD_LOG_DIR` environment variable.
 - `TD_NOTIFY_MIN_INTERVAL` – minimum seconds between report emails for a profile (default `3600`; `0` disables). Reports inside the window are skipped and noted in the Slurm output.

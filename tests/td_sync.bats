@@ -361,6 +361,25 @@ run_job() {
   [ "$(grep -c '^mail ' "$TD_MOCK_OUTPUT")" -eq 2 ]
 }
 
+@test "jobs request 1G of memory by default and honor TD_SLURM_MEM" {
+  submit_profile_fixture memdefault
+  grep -q -- '--mem=1G' "$PROJECT_ROOT/jobs/memdefault.job.sh"
+  submit_profile_fixture memset "TD_SLURM_MEM=512M"
+  grep -q -- '--mem=512M' "$PROJECT_ROOT/jobs/memset.job.sh"
+  ! grep -q -- '--mem=1G' "$PROJECT_ROOT/jobs/memset.job.sh" || false
+}
+
+@test "malformed TD_SLURM_MEM is rejected" {
+  config_dir="$BATS_TEST_TMPDIR/config-badmem"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/badmem.env"
+  printf 'TD_SLURM_MEM=4GB\n' >>"$config_dir/badmem.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"TD_SLURM_MEM must be a Slurm memory size"* ]]
+}
+
 @test "non-numeric TD_NOTIFY_MIN_INTERVAL is rejected" {
   config_dir="$BATS_TEST_TMPDIR/config-badthrottle"
   mkdir -p "$config_dir"

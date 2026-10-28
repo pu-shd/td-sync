@@ -27,6 +27,7 @@ Optional profile settings:
   TD_NOTIFY               Comma-separated recipient emails for notifications.
   TD_DRY_RUN              When 1/true, perform rsync dry-run.
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
+  TD_SLURM_MEM            Memory per job as a Slurm size, e.g. 512M or 1G (default: 1G).
   TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
   TD_NOTIFY_MIN_INTERVAL  Minimum seconds between report emails per profile (default: 3600; 0 disables).
   TD_EXCLUDE_ENVS         When 1/true, skip any source directory containing conda-meta/ or pyvenv.cfg,
@@ -144,7 +145,7 @@ purge_old_logs() {
 load_profile() {
   local profile_path="$1"
 
-  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL TD_EXCLUDE_ENVS
+  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_SLURM_MEM TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL TD_EXCLUDE_ENVS
   TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
@@ -174,6 +175,12 @@ validate_profile() {
     fi
   else
     TD_SLURM_RUNTIME="01:00:00"
+  fi
+
+  TD_SLURM_MEM="${TD_SLURM_MEM:-1G}"
+  if ! [[ "$TD_SLURM_MEM" =~ ^[1-9][0-9]*[KMGT]?$ ]]; then
+    log_error "[$profile_name] TD_SLURM_MEM must be a Slurm memory size such as 512M or 1G"
+    return 1
   fi
 
   if [[ -z "${TD_LOG_DIR:-}" || "$TD_LOG_DIR" != /* ]]; then
@@ -570,7 +577,7 @@ submit_profile() {
 
   local job_name="td-sync-$sanitized"
   local sbatch_args
-  sbatch_args=("--job-name=$job_name" "--time=$TD_SLURM_RUNTIME" "--account=$TD_SLURM_ACCOUNT" "--output=$log_dir/${sanitized}_slurm-%j.out")
+  sbatch_args=("--job-name=$job_name" "--time=$TD_SLURM_RUNTIME" "--mem=$TD_SLURM_MEM" "--account=$TD_SLURM_ACCOUNT" "--output=$log_dir/${sanitized}_slurm-%j.out")
 
   # Slurm sends this mail itself, so it still arrives when a job is killed before
   # the job script can report. --mail-user takes a single address.
