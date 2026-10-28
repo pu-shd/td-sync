@@ -168,7 +168,7 @@ run_job() {
   [ "$sbatch_line" -lt "$rsync_line" ]
   grep -q -- '--dependency=afterany:777' "$TD_MOCK_OUTPUT"
   grep -q -- '--begin=now+30' "$TD_MOCK_OUTPUT"
-  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "next run survives when the job is killed mid-rsync" {
@@ -177,7 +177,7 @@ run_job() {
   run_job killed
   [ "$status" -ne 0 ]
   grep -q '^sbatch .*--dependency=afterany:777' "$TD_MOCK_OUTPUT"
-  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "rsync failure cancels the already scheduled next run" {
@@ -209,7 +209,7 @@ run_job() {
   [[ "$output" == *"already queued"* ]]
   [[ -f "$PROJECT_ROOT/jobs/queued.job.sh" ]]
   grep -q '^squeue .*-n td-sync-queued' "$TD_MOCK_OUTPUT"
-  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "td-sync does not submit when squeue fails" {
@@ -218,7 +218,7 @@ run_job() {
   run "$PROJECT_ROOT/bin/td-sync"
   [ "$status" -ne 0 ]
   [[ "$output" == *"unable to query squeue"* ]]
-  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "Slurm emails the first recipient on failure and writes output next to the logs" {
@@ -242,7 +242,7 @@ run_job() {
 @test "no Slurm mail options without TD_NOTIFY" {
   submit_profile_fixture nomail
   run "$PROJECT_ROOT/bin/td-sync"
-  ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT"
+  ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT" || false
   grep -q -- '--output=' "$TD_MOCK_OUTPUT"
 }
 
@@ -307,7 +307,7 @@ run_job() {
   [[ "$output" == *"healthchecks ping /start failed"* ]]
   [[ "$output" == *"unable to email report to ops@example.org"* ]]
   grep -q '^sbatch --parsable' "$TD_MOCK_OUTPUT"
-  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "unsafe TD_HC_URL is rejected" {
@@ -420,14 +420,14 @@ make_env_tree() {
   submit_profile_fixture envoff "TD_SRC=$root/"
   run_job envoff
   [ "$status" -eq 0 ]
-  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT"
+  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "environment detection is skipped with a warning for a remote source" {
   submit_profile_fixture envremote "TD_SRC=host:/data/src/" "TD_EXCLUDE_ENVS=1"
   run_job envremote
   [ "$status" -eq 0 ]
-  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT"
+  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT" || false
   grep -q '^rsync ' "$TD_MOCK_OUTPUT"
   latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/envremote_*.log | head -1)"
   grep -q 'TD_EXCLUDE_ENVS ignored' "$latest_log"
