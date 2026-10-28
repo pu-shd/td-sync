@@ -8,7 +8,7 @@ The script ingests `.env` configuration profiles and produces self-resubmitting 
 
 - Auto-discovers configuration profiles from `$HOME/.config/td-sync.d` or `$TD_CONFIG_DIR`.
 - Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=now+TD_SUBMIT_INTERVAL`.
-- Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run.
+- Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run; a partial transfer (exit 23 or 24, e.g. unreadable or vanished files) is reported as a failure but keeps the schedule.
 - Skips submitting a profile that already has a job queued, so re-running `td-sync` never creates duplicate schedules.
 - Writes logs to a dedicated `td-sync/` subdirectory of `$TD_LOG_DIR` (default `$PWD/logs`), with optional retention via `TD_LOG_RETENTION_DAYS`.
 - Provides mock `sbatch`, `mail`, and `sendmail` utilities for isolated testing via `TD_TEST_MODE`.
@@ -45,8 +45,13 @@ Optional keys:
 - `TD_RSYNC_OPTS` – additional `rsync` flags (e.g., `--exclude .venv --delete`).
 - `TD_LOG_DIR` – absolute base directory for this profile's logs; overrides the `TD_LOG_DIR` environment variable.
 - `TD_NOTIFY_MIN_INTERVAL` – minimum seconds between report emails for a profile (default `3600`; `0` disables). Reports inside the window are skipped and noted in the Slurm output.
+- `TD_EXCLUDE_ENVS` – `1` or `true` to skip Python/conda environments wherever they are and whatever they are named (see below).
 - `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
 - `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
+
+## Excluding Environments
+
+Name-based filters such as `--filter='- .conda'` miss environments created with arbitrary names (e.g. `conda env create -p my_code`). With `TD_EXCLUDE_ENVS=1`, each run first scans a local `TD_SRC` for directories containing `conda-meta/` or `pyvenv.cfg`, logs each one, and excludes it with a pattern anchored at the transfer root, ahead of any `TD_RSYNC_OPTS` filters. The same scan finds packages installed with `pip install --target` (which have no environment root) by their `*.dist-info/RECORD` files and excludes exactly the top-level paths each RECORD lists (e.g. `numpy/`, `numpy.libs/`, `numpy-2.5.2.dist-info/`), leaving other files in that directory untouched; shared directories such as `bin/` are not excluded wholesale. A conda package cache (a directory with `urls.txt` and `cache/`) is excluded whole, and `site-packages`/`dist-packages` directories are never scanned, since they belong to an installed Python. The scan does not descend into environments it finds. It is skipped with a warning when `TD_SRC` is remote. Environments already copied to the destination are not removed.
 
 ## Monitoring with healthchecks.io
 

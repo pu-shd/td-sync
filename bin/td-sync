@@ -29,6 +29,8 @@ Optional profile settings:
   TD_SLURM_RUNTIME        HH:MM:SS job length (default: 01:00:00).
   TD_LOG_DIR              Absolute base directory for this profile's logs (overrides the environment).
   TD_NOTIFY_MIN_INTERVAL  Minimum seconds between report emails per profile (default: 3600; 0 disables).
+  TD_EXCLUDE_ENVS         When 1/true, skip any source directory containing conda-meta/ or pyvenv.cfg,
+                          and the paths listed in RECORD files of pip --target installs.
   TD_HC_URL               healthchecks.io ping URL; pinged at start and with the exit status at the end.
   TD_RELAY_HOST           Host to send pings and report email through via ssh, for compute nodes
                           without internet or working mail (e.g. della9).
@@ -142,7 +144,7 @@ purge_old_logs() {
 load_profile() {
   local profile_path="$1"
 
-  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL
+  unset TD_SRC TD_DEST TD_SUBMIT_INTERVAL TD_SLURM_ACCOUNT TD_NOTIFY TD_DRY_RUN TD_SLURM_RUNTIME TD_RSYNC_OPTS TD_HC_URL TD_RELAY_HOST TD_NOTIFY_MIN_INTERVAL TD_EXCLUDE_ENVS
   TD_LOG_DIR="$LOG_BASE_DEFAULT"
 
   # shellcheck disable=SC1090
@@ -230,6 +232,11 @@ write_job_script() {
     dry_flag="1"
   fi
 
+  local exclude_envs_flag="0"
+  if is_truthy "${TD_EXCLUDE_ENVS:-}"; then
+    exclude_envs_flag="1"
+  fi
+
   local mailer_escaped
   local td_src_escaped
   local td_dest_escaped
@@ -263,6 +270,7 @@ write_job_script() {
     printf 'TD_DEST=%s\n' "$td_dest_escaped"
     printf 'TD_NOTIFY=%s\n' "$td_notify_escaped"
     printf 'TD_DRY_RUN=%s\n' "$dry_flag"
+    printf 'TD_EXCLUDE_ENVS=%s\n' "$exclude_envs_flag"
     printf 'TD_SUBMIT_INTERVAL=%s\n' "$td_interval_escaped"
     printf 'TD_LOG_DIR=%s\n' "$log_dir_escaped"
   printf 'LOG_BASENAME=%s\n' "$log_base_escaped"
@@ -283,7 +291,8 @@ mkdir -p "${TD_LOG_DIR}"
 timestamp="$(date +"%Y%m%dT%H%M%S")"
 log_file="${TD_LOG_DIR}/${LOG_BASENAME}_${timestamp}.log"
 summary_file="$(mktemp)"
-trap 'rm -f "$summary_file"' EXIT
+exclude_file="$(mktemp)"
+trap 'rm -f "$summary_file" "$exclude_file"' EXIT
 
 # Compute nodes may have no internet or working mail; when TD_RELAY_HOST is set,
 # run outbound commands there over ssh, the same way rsync reaches a remote host.
@@ -307,18 +316,6 @@ hc_ping() {
 
 hc_ping /start </dev/null
 
-rsync_opts=("-av")
-if [[ "$TD_DRY_RUN" == "1" ]]; then
-  rsync_opts+=("--dry-run")
-fi
-if [[ -n "$TD_RSYNC_OPTS" ]]; then
-  extra_opts=()
-  eval "extra_opts=($TD_RSYNC_OPTS)"
-  rsync_opts+=("${extra_opts[@]}")
-  unset extra_opts
-fi
-rsync_opts+=("$TD_SRC" "$TD_DEST")
-
 {
   printf 'Tiny Data Sync job: %s\n' "$JOB_NAME"
   printf 'Started: %s\n' "$timestamp"
@@ -327,9 +324,9 @@ rsync_opts+=("$TD_SRC" "$TD_DEST")
   printf 'Dry run: %s\n\n' "$TD_DRY_RUN"
 } >"$log_file"
 
-# Schedule the next run before rsync starts, so a time limit, node failure, or
-# preemption that kills this job cannot break the chain. afterany keeps it from
-# starting while this run is still going.
+# Schedule the next run before any slow work (environment scan, rsync), so a time
+# limit, node failure, or preemption that kills this job cannot break the chain.
+# afterany keeps it from starting while this run is still going.
 next_job_id=""
 requeue_note="Requeue interval not set"
 if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
@@ -347,6 +344,107 @@ if [[ -n "$TD_SUBMIT_INTERVAL" ]]; then
   fi
 fi
 
+rsync_opts=("-av")
+if [[ "$TD_DRY_RUN" == "1" ]]; then
+  rsync_opts+=("--dry-run")
+fi
+
+# Environments can have any name, so find them by their marker files and exclude
+# each root with a pattern anchored at the transfer root; a conda package cache
+# (urls.txt plus cache/) is treated the same way. Packages installed with
+# `pip install --target` have no environment root, so exclude exactly the
+# top-level paths their dist-info RECORD lists, leaving neighboring files alone.
+# site-packages belongs to an installed Python, so it is never scanned for these.
+# These rules precede TD_RSYNC_OPTS because rsync applies the first matching filter.
+if [[ "$TD_EXCLUDE_ENVS" == "1" ]]; then
+  if [[ "$TD_SRC" =~ ^[^/]*: ]]; then
+    printf 'Warning: TD_EXCLUDE_ENVS ignored; cannot scan remote source %s\n\n' "$TD_SRC" >>"$log_file"
+  else
+    src_root="${TD_SRC%/}"
+    anchor_prefix=""
+    if [[ "$TD_SRC" != */ ]]; then
+      anchor_prefix="/$(basename "$src_root")"
+    fi
+
+    # Appends an anchored exclude for a path relative to the source root.
+    add_exclude() {
+      local pattern="${anchor_prefix}/$1"
+      # rsync honors backslash escapes only in patterns that contain wildcards.
+      if [[ "$pattern" == *[*?[]* ]]; then
+        pattern="$(printf '%s' "$pattern" | sed 's/[][*?\\]/\\&/g')"
+      fi
+      printf '%s\n' "$pattern" >>"$exclude_file"
+    }
+
+    # Prints the distinct top-level paths a RECORD file lists, skipping paths
+    # outside the install directory and shared directories such as bin/.
+    record_tops() {
+      local line path top
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == \"* ]]; then
+          path="${line#\"}"
+          path="${path%%\"*}"
+        else
+          path="${line%%,*}"
+        fi
+        top="${path%%/*}"
+        case "$top" in
+          ''|.|..|bin|Scripts|include|lib|lib64|share|etc|man) continue ;;
+        esac
+        printf '%s\n' "$top"
+      done <"$1" | sort -u
+    }
+
+    env_count=0
+    pkg_path_count=0
+    while IFS= read -r -d '' entry; do
+      kind="${entry%%$'\t'*}"
+      rel="${entry#*$'\t'}"
+      if [[ "$rel" == *$'\n'* ]]; then
+        printf 'Warning: not excluding a path with a newline in it\n' >>"$log_file"
+        continue
+      fi
+      if [[ "$kind" == "env" ]]; then
+        add_exclude "$rel/"
+        printf 'Excluding environment: /%s\n' "$rel" >>"$log_file"
+        env_count=$((env_count + 1))
+        continue
+      fi
+      record="$src_root/$rel/RECORD"
+      if [[ ! -f "$record" ]]; then
+        continue
+      fi
+      parent="$(dirname "$rel")"
+      if [[ "$parent" == "." ]]; then
+        parent=""
+      else
+        parent="$parent/"
+      fi
+      pkg_paths=0
+      while IFS= read -r top; do
+        add_exclude "${parent}${top}"
+        pkg_paths=$((pkg_paths + 1))
+      done < <(record_tops "$record")
+      pkg_name="$(basename "$rel")"
+      printf 'Excluding pip-installed %s in %s (%s paths)\n' "${pkg_name%.dist-info}" "${parent%/}" "$pkg_paths" >>"$log_file"
+      pkg_path_count=$((pkg_path_count + pkg_paths))
+    done < <(find "$src_root" -mindepth 1 -type d \( \
+      \( \( -name site-packages -o -name dist-packages \) -prune \) -o \
+      \( -exec test -e '{}/conda-meta' -o -e '{}/pyvenv.cfg' -o -f '{}/urls.txt' -a -d '{}/cache' \; -printf 'env\t%P\0' -prune \) -o \
+      \( -name '*.dist-info' -printf 'pkg\t%P\0' -prune \) \) 2>>"$log_file")
+    printf 'Excluded %s environment directories and %s pip-installed package paths\n\n' "$env_count" "$pkg_path_count" >>"$log_file"
+    rsync_opts+=("--exclude-from=$exclude_file")
+  fi
+fi
+
+if [[ -n "$TD_RSYNC_OPTS" ]]; then
+  extra_opts=()
+  eval "extra_opts=($TD_RSYNC_OPTS)"
+  rsync_opts+=("${extra_opts[@]}")
+  unset extra_opts
+fi
+rsync_opts+=("$TD_SRC" "$TD_DEST")
+
 set +e
 rsync "${rsync_opts[@]}" &>>"$log_file"
 rsync_status=$?
@@ -354,7 +452,10 @@ set -e
 
 if [[ $rsync_status -ne 0 ]]; then
   printf 'rsync exited with status %s\n' "$rsync_status" >>"$log_file"
-  if [[ -n "$next_job_id" ]]; then
+  if [[ -n "$next_job_id" ]] && (( rsync_status == 23 || rsync_status == 24 )); then
+    # Partial transfer: everything readable was copied, so keep the schedule alive.
+    requeue_note="Next run (job $next_job_id) kept; rsync exited with status $rsync_status (partial transfer, see log)"
+  elif [[ -n "$next_job_id" ]]; then
     if scancel "$next_job_id"; then
       requeue_note="Next run (job $next_job_id) cancelled; rsync exited with status $rsync_status"
     else
@@ -363,6 +464,7 @@ if [[ $rsync_status -ne 0 ]]; then
   else
     requeue_note="Job not requeued; rsync exited with status $rsync_status"
   fi
+  printf '%s\n' "$requeue_note" >>"$log_file"
 fi
 
 {

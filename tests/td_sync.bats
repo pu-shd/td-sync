@@ -168,7 +168,7 @@ run_job() {
   [ "$sbatch_line" -lt "$rsync_line" ]
   grep -q -- '--dependency=afterany:777' "$TD_MOCK_OUTPUT"
   grep -q -- '--begin=now+30' "$TD_MOCK_OUTPUT"
-  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "next run survives when the job is killed mid-rsync" {
@@ -177,7 +177,7 @@ run_job() {
   run_job killed
   [ "$status" -ne 0 ]
   grep -q '^sbatch .*--dependency=afterany:777' "$TD_MOCK_OUTPUT"
-  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "rsync failure cancels the already scheduled next run" {
@@ -209,7 +209,7 @@ run_job() {
   [[ "$output" == *"already queued"* ]]
   [[ -f "$PROJECT_ROOT/jobs/queued.job.sh" ]]
   grep -q '^squeue .*-n td-sync-queued' "$TD_MOCK_OUTPUT"
-  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "td-sync does not submit when squeue fails" {
@@ -218,7 +218,7 @@ run_job() {
   run "$PROJECT_ROOT/bin/td-sync"
   [ "$status" -ne 0 ]
   [[ "$output" == *"unable to query squeue"* ]]
-  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT"
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "Slurm emails the first recipient on failure and writes output next to the logs" {
@@ -242,7 +242,7 @@ run_job() {
 @test "no Slurm mail options without TD_NOTIFY" {
   submit_profile_fixture nomail
   run "$PROJECT_ROOT/bin/td-sync"
-  ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT"
+  ! grep -q -- '--mail-type' "$TD_MOCK_OUTPUT" || false
   grep -q -- '--output=' "$TD_MOCK_OUTPUT"
 }
 
@@ -256,6 +256,21 @@ run_job() {
   [ "$start_line" -lt "$rsync_line" ]
   grep -q 'curl .*\[https://hc-ping.com/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab/0\]' "$TD_MOCK_OUTPUT"
   grep -q 'Rsync exit status: 0' "$TD_MOCK_OUTPUT.curl-body"
+}
+
+@test "partial transfer (rsync 23/24) reports failure but keeps the next run" {
+  local code
+  for code in 23 24; do
+    submit_profile_fixture "partial$code"
+    export TD_MOCK_RSYNC_STATUS=$code TD_MOCK_JOB_ID=4242
+    run_job "partial$code"
+    [ "$status" -eq "$code" ]
+    ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
+    latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/partial${code}_*.log | head -1)"
+    grep -q "rsync exited with status $code" "$latest_log"
+    grep -q "Next run (job 4242) kept" "$latest_log"
+    rm -f "$TD_MOCK_OUTPUT"
+  done
 }
 
 @test "healthchecks receives the rsync exit status on failure" {
@@ -292,7 +307,7 @@ run_job() {
   [[ "$output" == *"healthchecks ping /start failed"* ]]
   [[ "$output" == *"unable to email report to ops@example.org"* ]]
   grep -q '^sbatch --parsable' "$TD_MOCK_OUTPUT"
-  ! grep -q '^scancel' "$TD_MOCK_OUTPUT"
+  ! grep -q '^scancel' "$TD_MOCK_OUTPUT" || false
 }
 
 @test "unsafe TD_HC_URL is rejected" {
@@ -355,4 +370,176 @@ run_job() {
   run "$PROJECT_ROOT/bin/td-sync"
   [ "$status" -ne 0 ]
   [[ "$output" == *"TD_NOTIFY_MIN_INTERVAL must be a whole number of seconds"* ]]
+}
+
+# Builds a source tree with a conda env, a venv, an env nested inside an env,
+# and ordinary data, under $BATS_TEST_TMPDIR/envsrc/proj.
+make_env_tree() {
+  local root="$BATS_TEST_TMPDIR/envsrc/proj"
+  mkdir -p "$root/plain_named_env/conda-meta" "$root/plain_named_env/lib" \
+    "$root/plain_named_env/pkgs/inner/conda-meta" \
+    "$root/code/venv_like" "$root/data/results" "$root/odd[name]*env/conda-meta"
+  touch "$root/code/venv_like/pyvenv.cfg" "$root/data/results/table.csv" "$root/plain_named_env/lib/libbig.so"
+  printf '%s\n' "$root"
+}
+
+@test "TD_EXCLUDE_ENVS excludes directories that contain conda-meta or pyvenv.cfg" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envs "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  run_job envs
+  [ "$status" -eq 0 ]
+  grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT"
+  excludes="$(cat "$TD_MOCK_OUTPUT.exclude-from")"
+  [ "$(wc -l <<<"$excludes")" -eq 3 ]
+  grep -qxF '/plain_named_env/' <<<"$excludes"
+  grep -qxF '/code/venv_like/' <<<"$excludes"
+  grep -qxF '/odd\[name\]\*env/' <<<"$excludes"
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/envs_*.log | head -1)"
+  grep -q 'Excluded 3 environment directories' "$latest_log"
+}
+
+@test "environment excludes are anchored at the source basename without a trailing slash" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envbase "TD_SRC=$root" "TD_EXCLUDE_ENVS=1"
+  run_job envbase
+  [ "$status" -eq 0 ]
+  grep -qxF '/proj/plain_named_env/' "$TD_MOCK_OUTPUT.exclude-from"
+}
+
+@test "environment excludes come before user rsync filters" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envorder "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1" "TD_RSYNC_OPTS=\"--filter='+ *'\""
+  run_job envorder
+  rsync_line="$(grep '^rsync ' "$TD_MOCK_OUTPUT")"
+  before_user="${rsync_line%%--filter=+ \**}"
+  [[ "$before_user" == *"--exclude-from="* ]]
+}
+
+@test "environment detection is off by default" {
+  root="$(make_env_tree)"
+  submit_profile_fixture envoff "TD_SRC=$root/"
+  run_job envoff
+  [ "$status" -eq 0 ]
+  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT" || false
+}
+
+@test "environment detection is skipped with a warning for a remote source" {
+  submit_profile_fixture envremote "TD_SRC=host:/data/src/" "TD_EXCLUDE_ENVS=1"
+  run_job envremote
+  [ "$status" -eq 0 ]
+  ! grep -q -- '--exclude-from=' "$TD_MOCK_OUTPUT" || false
+  grep -q '^rsync ' "$TD_MOCK_OUTPUT"
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/envremote_*.log | head -1)"
+  grep -q 'TD_EXCLUDE_ENVS ignored' "$latest_log"
+}
+
+@test "real rsync skips detected environments and copies everything else" {
+  real_rsync="$(PATH="${PATH//$PROJECT_ROOT\/mocks\/bin/}" command -v rsync || true)"
+  [ -n "$real_rsync" ] || skip "real rsync not installed"
+  root="$(make_env_tree)"
+  dest="$BATS_TEST_TMPDIR/envdest"
+  mkdir -p "$dest"
+  submit_profile_fixture envreal "TD_SRC=$root/" "TD_DEST=$dest/" "TD_EXCLUDE_ENVS=1"
+  tools="$BATS_TEST_TMPDIR/tools"
+  mkdir -p "$tools"
+  for tool in sbatch squeue scancel; do ln -sf "$PROJECT_ROOT/mocks/bin/$tool" "$tools/$tool"; done
+  ln -sf "$real_rsync" "$tools/rsync"
+  run env PATH="$tools:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/envreal.job.sh"
+  [ "$status" -eq 0 ]
+  [[ -f "$dest/data/results/table.csv" ]]
+  [[ ! -e "$dest/plain_named_env" ]]
+  [[ ! -e "$dest/code/venv_like" ]]
+  [[ ! -e "$dest/odd[name]*env" ]]
+}
+
+# Builds a project with a `pip install --target` directory mixed with user files,
+# under $BATS_TEST_TMPDIR/pipsrc/proj.
+make_pip_tree() {
+  local root="$BATS_TEST_TMPDIR/pipsrc/proj"
+  local tgt="$root/exp/9"
+  mkdir -p "$tgt/pkg/sub" "$tgt/pkg.libs" "$tgt/pkg-1.0.dist-info" "$tgt/we,ird" "$tgt/bin" \
+    "$root/exp/fom.egg-info" "$root/env1/conda-meta" "$root/env1/lib/dep-2.0.dist-info"
+  touch "$tgt/pkg/__init__.py" "$tgt/pkg/sub/core.so" "$tgt/pkg.libs/libx.so" "$tgt/mod.py" \
+    "$tgt/we,ird/f" "$tgt/bin/tool" "$tgt/keepme.py" "$root/exp/run.py" "$root/exp/fom.egg-info/PKG-INFO"
+  cat >"$tgt/pkg-1.0.dist-info/RECORD" <<'RECORD'
+pkg/__init__.py,sha256=abc,10
+pkg/sub/core.so,sha256=def,20
+pkg.libs/libx.so,,
+mod.py,sha256=ghi,5
+"we,ird/f",,
+bin/tool,,
+../../bin/f2py,,
+pkg-1.0.dist-info/RECORD,,
+RECORD
+  printf 'dep-2.0.dist-info/RECORD,,\n' >"$root/env1/lib/dep-2.0.dist-info/RECORD"
+  printf '%s\n' "$root"
+}
+
+@test "TD_EXCLUDE_ENVS excludes exactly the paths pip recorded for --target installs" {
+  root="$(make_pip_tree)"
+  submit_profile_fixture pip "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  run_job pip
+  [ "$status" -eq 0 ]
+  excludes="$(cat "$TD_MOCK_OUTPUT.exclude-from")"
+  expected=$'/env1/\n/exp/9/mod.py\n/exp/9/pkg\n/exp/9/pkg-1.0.dist-info\n/exp/9/pkg.libs\n/exp/9/we,ird'
+  [ "$(sort <<<"$excludes")" = "$expected" ]
+  latest_log="$(ls -t "$TD_LOG_DIR"/td-sync/pip_*.log | head -1)"
+  grep -q 'Excluding pip-installed pkg-1.0 in exp/9 (5 paths)' "$latest_log"
+}
+
+@test "real rsync skips pip-installed packages but keeps neighboring user files" {
+  real_rsync="$(PATH="${PATH//$PROJECT_ROOT\/mocks\/bin/}" command -v rsync || true)"
+  [ -n "$real_rsync" ] || skip "real rsync not installed"
+  root="$(make_pip_tree)"
+  dest="$BATS_TEST_TMPDIR/pipdest"
+  mkdir -p "$dest"
+  submit_profile_fixture pipreal "TD_SRC=$root/" "TD_DEST=$dest/" "TD_EXCLUDE_ENVS=1"
+  tools="$BATS_TEST_TMPDIR/tools"
+  mkdir -p "$tools"
+  for tool in sbatch squeue scancel; do ln -sf "$PROJECT_ROOT/mocks/bin/$tool" "$tools/$tool"; done
+  ln -sf "$real_rsync" "$tools/rsync"
+  run env PATH="$tools:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/pipreal.job.sh"
+  [ "$status" -eq 0 ]
+  [[ -f "$dest/exp/9/keepme.py" ]]
+  [[ -f "$dest/exp/9/bin/tool" ]]
+  [[ -f "$dest/exp/run.py" ]]
+  [[ -f "$dest/exp/fom.egg-info/PKG-INFO" ]]
+  [[ ! -e "$dest/exp/9/pkg" ]]
+  [[ ! -e "$dest/exp/9/pkg.libs" ]]
+  [[ ! -e "$dest/exp/9/mod.py" ]]
+  [[ ! -e "$dest/exp/9/pkg-1.0.dist-info" ]]
+  [[ ! -e "$dest/exp/9/we,ird" ]]
+  [[ ! -e "$dest/env1" ]]
+}
+
+@test "next run is scheduled before the environment scan" {
+  root="$(make_env_tree)"
+  submit_profile_fixture scanorder "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  tools="$BATS_TEST_TMPDIR/tools-scanorder"
+  mkdir -p "$tools"
+  real_find="$(command -v find)"
+  printf '#!/usr/bin/env bash\nprintf "find\\n" >>"$TD_MOCK_OUTPUT"\nexec %q "$@"\n' "$real_find" >"$tools/find"
+  chmod +x "$tools/find"
+  run env PATH="$tools:$PROJECT_ROOT/mocks/bin:$PATH" SLURM_JOB_ID=777 "$PROJECT_ROOT/jobs/scanorder.job.sh"
+  [ "$status" -eq 0 ]
+  sbatch_line="$(grep -n '^sbatch ' "$TD_MOCK_OUTPUT" | cut -d: -f1)"
+  find_line="$(grep -n '^find$' "$TD_MOCK_OUTPUT" | head -1 | cut -d: -f1)"
+  [ -n "$sbatch_line" ]
+  [ -n "$find_line" ]
+  [ "$sbatch_line" -lt "$find_line" ]
+}
+
+@test "conda package caches are excluded whole and site-packages is not scanned for pip installs" {
+  root="$BATS_TEST_TMPDIR/cachesrc/proj"
+  mkdir -p "$root/.conda/pkgs/cache" "$root/.conda/pkgs/numpy-2.0/site-packages/numpy-2.0.dist-info" \
+    "$root/py/lib/python3.12/site-packages/six-1.0.dist-info" "$root/tgt/six-1.0.dist-info"
+  touch "$root/.conda/pkgs/urls.txt"
+  printf 'numpy/__init__.py,,\n' >"$root/.conda/pkgs/numpy-2.0/site-packages/numpy-2.0.dist-info/RECORD"
+  printf 'six.py,,\n' >"$root/py/lib/python3.12/site-packages/six-1.0.dist-info/RECORD"
+  printf 'six.py,,\n' >"$root/tgt/six-1.0.dist-info/RECORD"
+  submit_profile_fixture cache "TD_SRC=$root/" "TD_EXCLUDE_ENVS=1"
+  run_job cache
+  [ "$status" -eq 0 ]
+  expected=$'/.conda/pkgs/\n/tgt/six.py'
+  [ "$(sort "$TD_MOCK_OUTPUT.exclude-from")" = "$expected" ]
 }
