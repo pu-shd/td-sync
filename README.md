@@ -6,7 +6,7 @@ The script ingests `.env` configuration profiles and produces self-resubmitting 
 
 ## Features
 
-- Auto-discovers configuration profiles from `$HOME/.config/td-sync.d` or `$TD_CONFIG_DIR`.
+- Auto-discovers configuration profiles from `$HOME/.config/td-sync.d` or `$TD_CONFIG_DIR`, so profiles can live in a separate config repo, with machine-specific values kept in local overrides.
 - Generates per-profile Slurm job scripts that execute `rsync`, log results, send notifications, and requeue themselves with `--begin=now+TD_SUBMIT_INTERVAL`.
 - Schedules each next run *before* `rsync` starts (with `--dependency=afterany:<this job>`), so a time limit, node failure, or preemption cannot silently end the schedule. A genuine `rsync` failure cancels that next run; a partial transfer (exit 23 or 24, e.g. unreadable or vanished files) is reported as a failure but keeps the schedule.
 - Skips submitting a profile that already has a job queued, so re-running `td-sync` never creates duplicate schedules.
@@ -50,12 +50,22 @@ Optional keys:
 - `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
 - `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
 
-## Local Overrides
+## Config Repos and Local Overrides
 
-Profiles can live in a shared config repo (point `TD_CONFIG_DIR` at a folder of a clone). Values that should stay on the machine, such as `TD_HC_URL` or `TD_NOTIFY`, go in a same-named file in `$HOME/.config/td-sync.d/local/` (or `$TD_LOCAL_DIR`), which is applied over the profile:
+Profiles can be kept in a separate, private config repo per organizational unit, with one
+folder per cluster (e.g. `della/osqp.env`), and `TD_CONFIG_DIR` pointed at that folder on
+the cluster. The repo can be cloned there, or pushed from a workstation that already has ssh
+access, so no GitHub credential has to live on the cluster. For an example with a deploy
+script and checks, see `pu-orfe/td-sync-config` (private). After the profiles change, rerun
+`td-sync` with the same `TD_CONFIG_DIR`: job scripts embed their settings, and queued runs
+use the refreshed script.
+
+Values that should stay on the machine, such as `TD_HC_URL` or `TD_NOTIFY`, go in a
+same-named file in `$HOME/.config/td-sync.d/local/` (or `$TD_LOCAL_DIR`), which is applied
+over the profile:
 
 ```bash
-mkdir -p ~/.config/td-sync.d/local
+mkdir -p -m 700 ~/.config/td-sync.d/local
 printf 'TD_HC_URL=https://hc-ping.com/<uuid>\n' > ~/.config/td-sync.d/local/osqp.env
 chmod 600 ~/.config/td-sync.d/local/osqp.env
 ```
