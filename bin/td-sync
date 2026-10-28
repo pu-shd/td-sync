@@ -12,6 +12,8 @@ Usage: td-sync [--help]
 Environment variables:
   TD_TEST_MODE            When set to 1 or true, use bundled mock commands for sbatch and mailer utilities.
   TD_CONFIG_DIR           Directory containing *.env configuration profiles (default: $HOME/.config/td-sync.d).
+  TD_LOCAL_DIR            Directory of local overrides: machine-specific values kept out of a shared
+                          config repo, applied over the same-named profile (default: $HOME/.config/td-sync.d/local).
   TD_LOG_DIR              Base directory for logs (default: $PWD/logs). Logs are written to a
                           td-sync/ subdirectory so a shared logs directory is never cluttered or purged.
   TD_LOG_RETENTION_DAYS   Number of days to retain log files before deletion.
@@ -150,6 +152,18 @@ load_profile() {
 
   # shellcheck disable=SC1090
   source "$profile_path"
+
+  local local_path
+  local_path="$LOCAL_DIR/$(basename "$profile_path")"
+  [[ -e "$local_path" ]] || return 0
+  # Overrides are sourced as shell, so nobody else may be able to change them.
+  if [[ ! -f "$local_path" || ! -O "$local_path" ]] ||
+     [[ -n "$(find "$local_path" -prune \( -perm -g+w -o -perm -o+w \) -print)" ]]; then
+    log_error "Refusing local overrides $local_path: must be a regular file you own, not writable by other users"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "$local_path"
 }
 
 validate_profile() {
@@ -559,7 +573,7 @@ submit_profile() {
   profile_filename="$(basename "$profile_path")"
   local profile_name="${profile_filename%.env}"
 
-  load_profile "$profile_path"
+  load_profile "$profile_path" || return 1
   validate_profile "$profile_name" || return 1
 
   local log_dir="$TD_LOG_DIR/td-sync"
@@ -663,6 +677,8 @@ main() {
       log_info "Created $config_dir but no configuration profiles were found."
     fi
   fi
+
+  LOCAL_DIR="${TD_LOCAL_DIR:-$HOME/.config/td-sync.d/local}"
 
   if [[ -n ${TD_LOG_DIR+x} ]]; then
     LOG_BASE_DEFAULT="$TD_LOG_DIR"

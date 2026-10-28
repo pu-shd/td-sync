@@ -12,6 +12,7 @@ setup() {
   unset TD_LOG_DIR
   unset TD_LOG_RETENTION_DAYS
   unset TD_RSYNC_OPTS
+  unset TD_LOCAL_DIR
   mkdir -p "$HOME"
   rm -f "$TD_MOCK_OUTPUT"
 }
@@ -561,4 +562,51 @@ RECORD
   [ "$status" -eq 0 ]
   expected=$'/.conda/pkgs/\n/tgt/six.py'
   [ "$(sort "$TD_MOCK_OUTPUT.exclude-from")" = "$expected" ]
+}
+
+@test "local overrides add machine-specific values to a profile" {
+  local_dir="$HOME/.config/td-sync.d/local"
+  mkdir -p "$local_dir"
+  printf 'TD_HC_URL=https://hc-ping.com/local-uuid\nTD_NOTIFY=me@example.com\n' >"$local_dir/withlocal.env"
+  chmod 600 "$local_dir/withlocal.env"
+  submit_profile_fixture withlocal "TD_NOTIFY=repo@example.com"
+  job="$(cat "$PROJECT_ROOT/jobs/withlocal.job.sh")"
+  [[ "$job" == *"TD_HC_URL=https://hc-ping.com/local-uuid"* ]]
+  [[ "$job" == *"TD_NOTIFY=me@example.com"* ]]
+  [[ "$job" != *"repo@example.com"* ]]
+}
+
+@test "TD_LOCAL_DIR selects the local overrides directory" {
+  export TD_LOCAL_DIR="$BATS_TEST_TMPDIR/elsewhere"
+  mkdir -p "$TD_LOCAL_DIR"
+  printf 'TD_HC_URL=https://hc-ping.com/elsewhere\n' >"$TD_LOCAL_DIR/movedlocal.env"
+  submit_profile_fixture movedlocal
+  grep -q 'TD_HC_URL=https://hc-ping.com/elsewhere' "$PROJECT_ROOT/jobs/movedlocal.job.sh"
+}
+
+@test "local overrides writable by others are refused" {
+  local_dir="$HOME/.config/td-sync.d/local"
+  mkdir -p "$local_dir"
+  printf 'TD_HC_URL=https://hc-ping.com/x\n' >"$local_dir/openlocal.env"
+  chmod 664 "$local_dir/openlocal.env"
+  config_dir="$BATS_TEST_TMPDIR/config-openlocal"
+  mkdir -p "$config_dir"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$config_dir/openlocal.env"
+  export TD_CONFIG_DIR="$config_dir"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"local overrides"*"writable by other users"* ]]
+  ! grep -q '^sbatch' "$TD_MOCK_OUTPUT" || false
+}
+
+@test "files in the local overrides directory are not treated as profiles" {
+  export TD_CONFIG_DIR="$HOME/.config/td-sync.d"
+  mkdir -p "$TD_CONFIG_DIR/local"
+  cp "$PROJECT_ROOT/tests/tmp.env" "$TD_CONFIG_DIR/only.env"
+  printf 'TD_HC_URL=https://hc-ping.com/x\n' >"$TD_CONFIG_DIR/local/stray.env"
+  export TD_LOG_DIR="$BATS_TEST_TMPDIR/logs-only"
+  run "$PROJECT_ROOT/bin/td-sync"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^sbatch' "$TD_MOCK_OUTPUT")" -eq 1 ]
+  [[ ! -e "$PROJECT_ROOT/jobs/stray.job.sh" ]]
 }
