@@ -50,6 +50,18 @@ Optional keys:
 - `TD_HC_URL` – [healthchecks.io](https://healthchecks.io) ping URL (see below).
 - `TD_RELAY_HOST` – host to send healthchecks pings and report email through over ssh (see below).
 
+## Local Overrides
+
+Profiles can live in a shared config repo (point `TD_CONFIG_DIR` at a folder of a clone). Values that should stay on the machine, such as `TD_HC_URL` or `TD_NOTIFY`, go in a same-named file in `$HOME/.config/td-sync.d/local/` (or `$TD_LOCAL_DIR`), which is applied over the profile:
+
+```bash
+mkdir -p ~/.config/td-sync.d/local
+printf 'TD_HC_URL=https://hc-ping.com/<uuid>\n' > ~/.config/td-sync.d/local/osqp.env
+chmod 600 ~/.config/td-sync.d/local/osqp.env
+```
+
+Overrides are read as shell assignments, like profiles, so td-sync refuses an overrides file you do not own or that other users can write to.
+
 ## Excluding Environments
 
 Name-based filters such as `--filter='- .conda'` miss environments created with arbitrary names (e.g. `conda env create -p my_code`). With `TD_EXCLUDE_ENVS=1`, each run first scans a local `TD_SRC` for directories containing `conda-meta/` or `pyvenv.cfg`, logs each one, and excludes it with a pattern anchored at the transfer root, ahead of any `TD_RSYNC_OPTS` filters. The same scan finds packages installed with `pip install --target` (which have no environment root) by their `*.dist-info/RECORD` files and excludes exactly the top-level paths each RECORD lists (e.g. `numpy/`, `numpy.libs/`, `numpy-2.5.2.dist-info/`), leaving other files in that directory untouched; shared directories such as `bin/` are not excluded wholesale. A conda package cache (a directory with `urls.txt` and `cache/`) is excluded whole, and `site-packages`/`dist-packages` directories are never scanned, since they belong to an installed Python. The scan does not descend into environments it finds. It is skipped with a warning when `TD_SRC` is remote. Environments already copied to the destination are not removed.
